@@ -224,7 +224,7 @@ custom_hooks = [dict(type='EmptyCacheHook', after_iter=True)]
 default_hooks = dict(
     checkpoint=dict(interval=1, max_keep_ckpts=16))
 
-load_from = 'work_dirs/tmp/sstnet_scannet.pth'
+load_from = '/root/wish/oneformer3d_main/sstnet_scannet.pth'
 
 train_cfg = dict(
     type='EpochBasedTrainLoop',

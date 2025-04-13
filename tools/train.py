@@ -10,11 +10,14 @@ from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet3d.utils import replace_ceph_backend
-
+import torch
+torch.autograd.set_detect_anomaly(True)
+import sys
+sys.path.append("/root/wish/oneformer3d_main")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a 3D detector')
-    parser.add_argument('config', help='train config file path')
+    parser.add_argument('--config', default="/root/wish/oneformer3d_main/configs/oneformer3d_1xb4_scannet.py", help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--amp',

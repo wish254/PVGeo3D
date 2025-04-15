@@ -1,0 +1,10 @@
+# ninja log v5
+1	14770	1744614176781623403	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/bindings.o	399306f5580fbbc3
+0	15020	1744614177033620145	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/ball_query.o	f2babc2c69739eb5
+2	15078	1744614177093619368	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/interpolate.o	653ab1f0df04d8f2
+1	15158	1744614177169618387	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/group_points.o	edd22af8921dc203
+2	15163	1744614177173618334	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/sampling.o	55783a54b017cfc9
+1	35268	1744614197269358718	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/group_points_gpu.o	b341722cfca7db75
+0	35544	1744614197541355207	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/ball_query_gpu.o	b04a3851bcc3a7a5
+2	35550	1744614197561354950	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/interpolate_gpu.o	54f5121c7d6df485
+3	37373	1744614199373331568	/root/wish/oneformer3d_main/ViT/Point-NN-main/pointnet2_ops_lib/build/temp.linux-x86_64-3.8/pointnet2_ops/_ext-src/src/sampling_gpu.o	9d02018bb656cbe9

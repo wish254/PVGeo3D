@@ -3,7 +3,7 @@ import argparse
 import logging
 import os
 import os.path as osp
-
+import timm
 from mmengine.config import Config, DictAction
 from mmengine.logging import print_log
 from mmengine.registry import RUNNERS
@@ -28,14 +28,14 @@ def parse_args():
         '--auto-scale-lr',
         action='store_true',
         help='enable automatically scaling LR.')
-    parser.add_argument(
-        '--resume',
+    parser.add_argument('--resume', 
         nargs='?',
         type=str,
         const='auto',
         help='If specify checkpoint path, resume from it, while if not '
         'specify, try to auto resume from the latest checkpoint '
-        'in the work directory.')
+        'in the work directory.'
+        )
     parser.add_argument(
         '--ceph', action='store_true', help='Use ceph as data storage backend')
     parser.add_argument(

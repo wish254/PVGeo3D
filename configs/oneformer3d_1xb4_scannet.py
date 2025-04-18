@@ -31,7 +31,7 @@ model = dict(
         num_semantic_classes=num_semantic_classes,
         num_semantic_linears=1,
         in_channels=32,
-        d_model=256,
+        d_model=768,
         num_heads=8,
         hidden_dim=1024,
         dropout=0.0,
@@ -166,8 +166,8 @@ test_pipeline = [
 
 # run settings
 train_dataloader = dict(
-    batch_size=4,
-    num_workers=6,
+    batch_size=2,
+    num_workers=1,
     dataset=dict(
         type=dataset_type,
         ann_file='scannet_oneformer3d_infos_train.pkl',

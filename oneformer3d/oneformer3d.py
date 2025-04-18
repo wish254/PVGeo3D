@@ -195,7 +195,12 @@ class ScanNetOneFormer3DMixin:
         for i in range(len(x)):
             if self.query_thr < 1:
                 n = (1 - self.query_thr) * torch.rand(1) + self.query_thr
+                # print(len(x[i]))
+                # print(n)
                 n = (n * len(x[i])).int()
+                if n.item() > 2500:
+                    n = 2000
+                # print(n)
                 ids = torch.randperm(len(x[i]))[:n].to(x[i].device)
                 queries.append(x[i][ids])
                 gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
@@ -285,10 +290,18 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             List[Tensor]: of len batch_size,
                 each of shape (n_points_i, n_channels).
         """
+        # x为SparseConvTensor，torch.size([N, 6])
         x = self.input_conv(x)
+        # x为SparseConvTensor，torch.size([N, 32])
         x, _ = self.unet(x)
+        # x为SparseConvTensor，torch.size([N, 32])
         x = self.output_layer(x)
         x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
+        # if x.shape[0] > 6500:
+        #     indices = torch.randperm(x.shape[0])[:6000]
+        #     x = x[indices]
+        # print(x.shape)
+        # x为tensor，[N', 32]
         out = []
         for i in range(len(batch_offsets) - 1):
             out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
@@ -317,7 +330,9 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 [((el_p - el_p.min(0)[0]),
                   torch.hstack((p[:, 3:], p[:, :3] - p[:, :3].mean(0))))
                  for el_p, p in zip(elastic_points, points)])
-        
+       
+        # print(coordinates.shape)
+        # print(features.shape)
         spatial_shape = torch.clip(
             coordinates.max(0)[0][1:] + 1, self.min_spatial_shape)
         field = ME.TensorField(features=features, coordinates=coordinates)
@@ -344,6 +359,13 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         Returns:
             dict: A dictionary of loss components.
         """
+        # for i in range(len(batch_inputs_dict['points'])):
+        #     points = batch_inputs_dict['points'][i]
+        #     if points.shape[0] > 700000:
+        #         indices = torch.randperm(points.shape[0])[:700000]
+        #         batch_inputs_dict['points'][i] = points[indices]
+        #         gt_pts_seg = batch_data_samples[i].gt_pts_seg
+        #         gt_pts_seg.sp_pts_mask = gt_pts_seg.sp_pts_mask[indices]
         batch_offsets = [0]
         superpoint_bias = 0
         sp_gt_instances = []
@@ -361,13 +383,30 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         coordinates, features, inverse_mapping, spatial_shape = self.collate(
             batch_inputs_dict['points'],
             batch_inputs_dict.get('elastic_coords', None))
-
+        # print(batch_inputs_dict[0].shape)
+        # print(batch_inputs_dict[1].shape)
         x = spconv.SparseConvTensor(
             features, coordinates, spatial_shape, len(batch_data_samples))
         sp_pts_masks = torch.hstack(sp_pts_masks)
+        # print(x.features.shape)
         x = self.extract_feat(
             x, sp_pts_masks, inverse_mapping, batch_offsets)
+        # print(x[0].shape)
+        # print(x[1].shape)
+        # print("=======================================================")
+        # print(x[2].shape)
+        # print(x[3].shape)
+        # print("-----------------------------------------------")
+        # x是一个列表，列表长度为Batch Size，这里为4，里面每一个元素都是tensor类型。但是其中每一个tensor类型为[N', 32]。但是四个元素的N‘都不一样。
         queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)
+        # print(len(queries))
+        # print(queries[0].shape)
+        # print(queries[1].shape)
+        # print(queries[2].shape)
+        # print(queries[3].shape)
+        # print("-----------------------------------------------")
+        # queries和x一样的列表。sp_gt_instances是用于算损失的，可以不看。
+        # 和x一样，N'都不相同，但是也queries[0]和x[0]的N'Y也不相同
         x = self.decoder(x, queries)
         loss = self.criterion(x, sp_gt_instances)
         return loss
@@ -411,8 +450,8 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         sp_pts_masks = torch.hstack(sp_pts_masks)
         x = self.extract_feat(
             x, sp_pts_masks, inverse_mapping, batch_offsets)
+        
         x = self.decoder(x, x)
-
         results_list = self.predict_by_feat(x, sp_pts_masks)
         for i, data_sample in enumerate(batch_data_samples):
             data_sample.pred_pts_seg = results_list[i]

@@ -1,6 +1,8 @@
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import timm
+import sys
+sys.path.append("/root/wish/oneformer3d_main/ViT/Point-NN-main")
 from models.point_pn import Point_PN_scan, Point_PN_mn40
 from models.transformer import *
 import torch.nn.functional as F
@@ -83,9 +85,11 @@ class APF(nn.Module):
         x = x + x_hat
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = x + self.pos_embed
+        # x.shape为[B, N, 768]
         for idx, blk in enumerate(self.blocks):
-            x = torch.cat((x[:, :idx + 1, :], prompt, x[:, -G:, :]), dim=1)
+            # x = torch.cat((x[:, :idx + 1, :], prompt, x[:, -G:, :]), dim=1)
             x = blk(x)
+        # x输出也是[B, N, 768]
         # x = torch.cat((x[:, :12, :], prompt, x[:, -G:, :]), dim=1)
         x = self.enc_norm(x)
         x = x.mean(dim=1)[0] + x.max(dim=1)[0]
@@ -137,7 +141,7 @@ def create_point_former(num_classes):
 
 if __name__ == '__main__':
 
-    x = torch.rand(32, 1024, 6).to('cuda')
+    x = torch.rand(1, 1024, 6).to('cuda')
     model = create_point_former(num_classes=15).to('cuda')
     x = model(x.permute(0, 2, 1), x[:, :, :3], extra=True)
     tuning_num_params = 0

@@ -3,7 +3,10 @@ import torch.nn as nn
 
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS
-
+import sys
+sys.path.append("/root/wish/oneformer3d_main/ViT/Point-NN-main")
+from models.transformer import *
+import torch.nn.functional as F
 
 class CrossAttentionLayer(BaseModule):
     """Cross attention layer.
@@ -49,7 +52,7 @@ class CrossAttentionLayer(BaseModule):
         for i in range(len(sources)):
             k = v = sources[i]
             attn_mask = attn_masks[i] if attn_masks is not None else None
-            output, _ = self.attn(queries[i], k, v, attn_mask=attn_mask)
+            output, _ = self.attn(queries[i], k, v, attn_mask=attn_mask) #k, v均为自身
             if self.fix:
                 output = self.dropout(output)
             output = output + queries[i]
@@ -157,18 +160,22 @@ class QueryDecoder(BaseModule):
     def __init__(self, num_layers, num_instance_queries, num_semantic_queries,
                  num_classes, in_channels, d_model, num_heads, hidden_dim,
                  dropout, activation_fn, iter_pred, attn_mask, fix_attention,
-                 objectness_flag, **kwargs):
+                 objectness_flag, vit_embed_dim=768, vit_num_heads=12,
+                 vit_mlp_ratio=4., vit_qkv_bias=True, vit_drop_rate=0.,
+                 vit_attn_drop_rate=0., vit_norm_layer=nn.LayerNorm,
+                 vit_act_layer=nn.GELU, vit_depth=12, vit_drop_path_rate=0., **kwargs):
         super().__init__()
         self.objectness_flag = objectness_flag
         self.input_proj = nn.Sequential(
-            nn.Linear(in_channels, d_model), nn.LayerNorm(d_model), nn.ReLU())
+             nn.Linear(in_channels, d_model // 2), nn.LayerNorm(d_model // 2), nn.ReLU(),
+            nn.Linear(d_model // 2, d_model), nn.LayerNorm(d_model), nn.ReLU())
         self.num_queries = num_instance_queries + num_semantic_queries
         if num_instance_queries + num_semantic_queries > 0:
             self.query = nn.Embedding(num_instance_queries + num_semantic_queries, d_model)
         if num_instance_queries == 0:
             self.query_proj = nn.Sequential(
-                nn.Linear(in_channels, d_model), nn.ReLU(),
-                nn.Linear(d_model, d_model))
+             nn.Linear(in_channels, d_model // 2), nn.LayerNorm(d_model // 2), nn.ReLU(),
+            nn.Linear(d_model // 2, d_model), nn.LayerNorm(d_model), nn.ReLU())
         self.cross_attn_layers = nn.ModuleList([])
         self.self_attn_layers = nn.ModuleList([])
         self.ffn_layers = nn.ModuleList([])
@@ -188,10 +195,27 @@ class QueryDecoder(BaseModule):
             self.out_score = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 1))
         self.x_mask = nn.Sequential(
-            nn.Linear(in_channels, d_model), nn.ReLU(),
-            nn.Linear(d_model, d_model))
+             nn.Linear(in_channels, d_model // 2), nn.LayerNorm(d_model // 2), nn.ReLU(),
+             nn.Linear(d_model // 2, d_model), nn.LayerNorm(d_model), nn.ReLU(),
+             nn.Linear(d_model, d_model))
         self.iter_pred = iter_pred
         self.attn_mask = attn_mask
+
+        #vit
+        dpr = [x.item() for x in torch.linspace(0, vit_drop_path_rate, vit_depth)]
+        self.blocks = nn.Sequential(*[
+            Block(
+                dim=vit_embed_dim, num_heads=vit_num_heads, mlp_ratio=vit_mlp_ratio, qkv_bias=vit_qkv_bias, drop=vit_drop_rate,
+                attn_drop=vit_attn_drop_rate, drop_path=dpr[i], norm_layer=vit_norm_layer, act_layer=vit_act_layer)
+            for i in range(vit_depth)])
+        
+        #融合
+        self.fuse_blocks = nn.Sequential(*[
+            nn.Conv1d(768 * 2, 768, kernel_size = 1)
+            for i in range(vit_depth)])
+
+        
+
     
     def _get_queries(self, queries=None, batch_size=None):
         """Get query tensor.
@@ -273,9 +297,16 @@ class QueryDecoder(BaseModule):
         mask_feats = [self.x_mask(y) for y in x]
         queries = self._get_queries(queries, len(x))
         for i in range(len(self.cross_attn_layers)):
+            vit_queries = []
+            for x in queries:
+                x = self.blocks[2 * i](x.unsequeen(0)).sequeen(0)
+                x = self.blocks[2 * i + 1](x.unsequeen(0)).sequeen(0)
+                vit_queries.append(self.blocks[i](x))
             queries = self.cross_attn_layers[i](inst_feats, queries)
             queries = self.self_attn_layers[i](queries)
             queries = self.ffn_layers[i](queries)
+            queries = [self.fuse_blocks[i](torch.cat([s1.unsequeen(0), s2.unsequeen(0)])).sequeen(0) for s1, s2 in zip(vit_queries, queries)]
+            
         cls_preds, pred_scores, pred_masks, _ = self._forward_head(
             queries, mask_feats)
         return dict(
@@ -447,16 +478,28 @@ class ScanNetQueryDecoder(QueryDecoder):
         inst_feats = [self.input_proj(y) for y in x]
         mask_feats = [self.x_mask(y) for y in x]
         queries = self._get_queries(queries, len(x))
+        #这里主要是对queries的维度进行转化
         cls_pred, sem_pred, pred_score, pred_mask, attn_mask = \
             self._forward_head(queries, mask_feats, last_flag=False)
         cls_preds.append(cls_pred)
         sem_preds.append(sem_pred)
         pred_scores.append(pred_score)
         pred_masks.append(pred_mask)
+        # print(inst_feats[0].shape)
+        # print(queries[0].shape)
+        # print(inst_feats[1].shape)
+        # print(queries[1].shape)
         for i in range(len(self.cross_attn_layers)):
+            vit_queries = []
+            for x in queries:
+                x = self.blocks[2 * i](x.unsqueeze(0))
+                x = self.blocks[2 * i + 1](x).squeeze(0)
+                vit_queries.append(x)
             queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
-            queries = self.self_attn_layers[i](queries)
-            queries = self.ffn_layers[i](queries)
+            queries = self.self_attn_layers[i](queries)  #这里是自注意力：即k, q, v均为同一个值
+            queries = self.ffn_layers[i](queries)  #一个全连接层
+            queries = [self.fuse_blocks[i](torch.cat([s1.unsqueeze(0), s2.unsqueeze(0)], dim=2).transpose(1, 2)).transpose(2, 1).squeeze(0) 
+                       for s1, s2 in zip(vit_queries, queries)]
             last_flag = i == len(self.cross_attn_layers) - 1
             cls_pred, sem_pred, pred_score, pred_mask, attn_mask = \
                 self._forward_head(queries, mask_feats, last_flag)

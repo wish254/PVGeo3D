@@ -175,40 +175,55 @@ class ScanNetOneFormer3DMixin:
         return sem_map, inst_map
     
     def _select_queries(self, x, gt_instances):
-        """Select queries for train pass.
-
+        """Select queries based on EMO cost function (instead of random).
+        
         Args:
-            x (List[Tensor]): of len batch_size, each of shape
-                (n_points_i, n_channels).
-            gt_instances (List[InstanceData_]): of len batch_size.
-                Ground truth which can contain `labels` of shape (n_gts_i,),
-                `sp_masks` of shape (n_gts_i, n_points_i).
-
+            x (List[Tensor]): [batch_size, n_points, n_channels]
+            gt_instances (List[InstanceData_]): Ground truth with `labels` and `sp_masks`.
+            
         Returns:
-            Tuple:
-                List[Tensor]: Queries of len batch_size, each queries of shape
-                    (n_queries_i, n_channels).
-                List[InstanceData_]: of len batch_size, each updated
-                    with `query_masks` of shape (n_gts_i, n_queries_i).
+            Tuple[List[Tensor], List[InstanceData_]]: Selected queries and updated masks.
         """
         queries = []
         for i in range(len(x)):
+            points = x[i]  # [n_points, n_channels]
+            sp_masks = gt_instances[i].sp_masks  # [n_gts, n_points]
+            
+            # 1. 计算成本矩阵（点间差异越大，成本越高）
+            cost_matrix = self._compute_emo_cost(points)  # [n_points, n_points]
+            
+            # 2. 选点策略：选择与其他点差异最大的Top-K点
             if self.query_thr < 1:
-                n = (1 - self.query_thr) * torch.rand(1) + self.query_thr
-                # print(len(x[i]))
-                # print(n)
-                n = (n * len(x[i])).int()
-                if n.item() > 2500:
-                    n = 2000
-                # print(n)
-                ids = torch.randperm(len(x[i]))[:n].to(x[i].device)
-                queries.append(x[i][ids])
-                gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
+                n = int((1 - self.query_thr) * len(points))
+                n = min(n, 2000)  # 上限2000
+                selected_ids = self._select_by_cost(cost_matrix, n)
             else:
-                queries.append(x[i])
-                gt_instances[i].query_masks = gt_instances[i].sp_masks
+                selected_ids = torch.arange(len(points), device=points.device)
+            
+            # 3. 保存结果
+            queries.append(points[selected_ids])
+            gt_instances[i].query_masks = sp_masks[:, selected_ids]
+        
         return queries, gt_instances
 
+    def _compute_emo_cost(self, points):
+        """计算点之间的EMO成本矩阵（越大表示差异越大）"""
+        # 归一化特征
+        points_norm = points / (torch.norm(points, dim=1, keepdim=True) + 1e-6)
+        # 余弦距离矩阵（1 - 相似度）
+        cost_matrix = 1 - torch.mm(points_norm, points_norm.T)  # [n_points, n_points]
+        return cost_matrix
+
+    def _select_by_cost(self, cost_matrix, n):
+        """根据成本矩阵选择最具区分度的n个点"""
+        # 策略1：选择与其他点平均差异最大的点
+        point_importance = cost_matrix.mean(dim=1)  # [n_points]
+        selected_ids = torch.topk(point_importance, n).indices
+        
+        # 策略2（可选）：用Sinkhorn算法优化全局分布
+        # selected_ids = self._sinkhorn_selection(cost_matrix, n)
+        
+        return selected_ids
 
 @MODELS.register_module()
 class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
@@ -297,11 +312,6 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         # x为SparseConvTensor，torch.size([N, 32])
         x = self.output_layer(x)
         x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
-        # if x.shape[0] > 6500:
-        #     indices = torch.randperm(x.shape[0])[:6000]
-        #     x = x[indices]
-        # print(x.shape)
-        # x为tensor，[N', 32]
         out = []
         for i in range(len(batch_offsets) - 1):
             out.append(x[batch_offsets[i]: batch_offsets[i + 1]])
@@ -359,13 +369,6 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         Returns:
             dict: A dictionary of loss components.
         """
-        # for i in range(len(batch_inputs_dict['points'])):
-        #     points = batch_inputs_dict['points'][i]
-        #     if points.shape[0] > 700000:
-        #         indices = torch.randperm(points.shape[0])[:700000]
-        #         batch_inputs_dict['points'][i] = points[indices]
-        #         gt_pts_seg = batch_data_samples[i].gt_pts_seg
-        #         gt_pts_seg.sp_pts_mask = gt_pts_seg.sp_pts_mask[indices]
         batch_offsets = [0]
         superpoint_bias = 0
         sp_gt_instances = []
@@ -383,32 +386,15 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         coordinates, features, inverse_mapping, spatial_shape = self.collate(
             batch_inputs_dict['points'],
             batch_inputs_dict.get('elastic_coords', None))
-        # print(batch_inputs_dict[0].shape)
-        # print(batch_inputs_dict[1].shape)
         x = spconv.SparseConvTensor(
             features, coordinates, spatial_shape, len(batch_data_samples))
         sp_pts_masks = torch.hstack(sp_pts_masks)
-        # print(x.features.shape)
         x = self.extract_feat(
             x, sp_pts_masks, inverse_mapping, batch_offsets)
-        # print(x[0].shape)
-        # print(x[1].shape)
-        # print("=======================================================")
-        # print(x[2].shape)
-        # print(x[3].shape)
-        # print("-----------------------------------------------")
-        # x是一个列表，列表长度为Batch Size，这里为4，里面每一个元素都是tensor类型。但是其中每一个tensor类型为[N', 32]。但是四个元素的N‘都不一样。
-        queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)
-        # print(len(queries))
-        # print(queries[0].shape)
-        # print(queries[1].shape)
-        # print(queries[2].shape)
-        # print(queries[3].shape)
-        # print("-----------------------------------------------")
-        # queries和x一样的列表。sp_gt_instances是用于算损失的，可以不看。
-        # 和x一样，N'都不相同，但是也queries[0]和x[0]的N'Y也不相同
+        queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)    
         x = self.decoder(x, queries)
-        loss = self.criterion(x, sp_gt_instances)
+        weights = self.decoder.out_cls[2].weight.data.detach()
+        loss = self.criterion(x, sp_gt_instances, weights)
         return loss
     
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):

@@ -17,7 +17,7 @@ class ScanNetUnifiedCriterion:
         self.sem_criterion = MODELS.build(sem_criterion)
         self.inst_criterion = MODELS.build(inst_criterion)
     
-    def __call__(self, pred, insts):
+    def __call__(self, pred, insts, weights):
         """Calculate loss.
 
         Args:
@@ -59,7 +59,7 @@ class ScanNetUnifiedCriterion:
                 inst_gt.query_masks = insts[i].query_masks[:-n - 1, :]
             inst_gts.append(inst_gt)
         
-        loss = self.inst_criterion(pred, inst_gts)
+        loss = self.inst_criterion(pred, inst_gts, weights)
         loss.update(self.sem_criterion(pred, sem_gts))
         return loss
 

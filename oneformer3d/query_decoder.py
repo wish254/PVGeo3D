@@ -188,7 +188,7 @@ class QueryDecoder(BaseModule):
             self.ffn_layers.append(
                 FFN(d_model, hidden_dim, dropout, activation_fn))
         self.out_norm = nn.LayerNorm(d_model)
-        self.out_cls = nn.Sequential(
+        self.out_cls = nn.Sequential(        ######
             nn.Linear(d_model, d_model), nn.ReLU(),
             nn.Linear(d_model, num_classes + 1))
         if objectness_flag:
@@ -212,7 +212,7 @@ class QueryDecoder(BaseModule):
         #融合
         self.fuse_blocks = nn.Sequential(*[
             nn.Conv1d(768 * 2, 768, kernel_size = 1)
-            for i in range(vit_depth)])
+            for i in range(6)])
 
         
 
@@ -293,6 +293,7 @@ class QueryDecoder(BaseModule):
         Returns:
             Dict: with labels, masks, and scores.
         """
+        emo_losses = []
         inst_feats = [self.input_proj(y) for y in x]
         mask_feats = [self.x_mask(y) for y in x]
         queries = self._get_queries(queries, len(x))
@@ -300,7 +301,7 @@ class QueryDecoder(BaseModule):
             vit_queries = []
             for x in queries:
                 x = self.blocks[2 * i](x.unsequeen(0)).sequeen(0)
-                x = self.blocks[2 * i + 1](x.unsequeen(0)).sequeen(0)
+                x = self.blocks[2 * i + 1](x.unsequeen(0), 2 * i + 1).sequeen(0)
                 vit_queries.append(self.blocks[i](x))
             queries = self.cross_attn_layers[i](inst_feats, queries)
             queries = self.self_attn_layers[i](queries)
@@ -312,7 +313,7 @@ class QueryDecoder(BaseModule):
         return dict(
             cls_preds=cls_preds,
             masks=pred_masks,
-            scores=pred_scores)
+            scores=pred_scores), emo_losses
 
     def forward_iter_pred(self, x, queries):
         """Iterative forward pass.
@@ -329,6 +330,8 @@ class QueryDecoder(BaseModule):
         cls_preds, pred_scores, pred_masks = [], [], []
         inst_feats = [self.input_proj(y) for y in x]
         mask_feats = [self.x_mask(y) for y in x]
+        for i in range(len(mask_feats)):
+            print(mask_feats[i].shape)
         queries = self._get_queries(queries, len(x))
         cls_pred, pred_score, pred_mask, attn_mask = self._forward_head(
             queries, mask_feats)
@@ -344,7 +347,6 @@ class QueryDecoder(BaseModule):
             cls_preds.append(cls_pred)
             pred_scores.append(pred_score)
             pred_masks.append(pred_mask)
-
         aux_outputs = [
             {'cls_preds': cls_pred, 'masks': masks, 'scores': scores}
             for cls_pred, scores, masks in zip(
@@ -430,6 +432,7 @@ class ScanNetQueryDecoder(QueryDecoder):
                 attn_mask = attn_mask.detach()
                 attn_masks.append(attn_mask)
             pred_masks.append(pred_mask)
+        
         attn_masks = attn_masks if self.attn_mask else None
         sem_preds = sem_preds if last_flag else None
         return cls_preds, sem_preds, pred_scores, pred_masks, attn_masks

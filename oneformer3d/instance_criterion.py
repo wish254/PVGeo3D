@@ -1,10 +1,12 @@
 import torch
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
-
+import torch.nn as nn
 from .structures import InstanceData_
 from mmdet3d.registry import MODELS, TASK_UTILS
-
+from transformers import ViTForImageClassification
+import timm
+from .query_decoder import QueryDecoder
 
 def batch_sigmoid_bce_loss(inputs, targets):
     """Sigmoid BCE loss.
@@ -103,6 +105,7 @@ class InstanceCriterion:
 
     def __init__(self, matcher, loss_weight, non_object_weight, num_classes,
                  fix_dice_loss_weight, iter_matcher, fix_mean_loss=False):
+        super().__init__()
         self.matcher = TASK_UTILS.build(matcher)
         class_weight = [1] * num_classes + [non_object_weight]
         self.class_weight = class_weight
@@ -118,6 +121,20 @@ class InstanceCriterion:
             [torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
+
+    def compute_emo_loss(self, cls_pred, cls_target, weights, smoothing=0.1):
+        one_hot = torch.nn.functional.one_hot(cls_target, num_classes = self.num_classes + 1).float()
+        # one_hot = one_hot * (1 - smoothing) + smoothing / (self.num_classes + 1)
+        stable_onehot = (one_hot + 1e-15) / torch.linalg.vector_norm((one_hot + 1e-15), ord=1, dim=-1, keepdim=True)
+        embedding_matrix = weights
+        embedding_matrix = embedding_matrix / torch.linalg.vector_norm(embedding_matrix, ord=2, dim=1, keepdim=True)
+        p_contextual_repr = stable_onehot @ embedding_matrix
+        q_grad = torch.log_softmax(cls_pred, dim=-1).exp()
+        gt_q = (q_grad * one_hot).detach()
+        q_final = q_grad - gt_q
+        q_contextual_repr = q_final @ embedding_matrix 
+        emo_loss = torch.abs((1 - torch.sum(p_contextual_repr*q_contextual_repr, dim=-1)) - (1 - torch.sum(p_contextual_repr*p_contextual_repr, dim=-1)))
+        return emo_loss
 
     def get_layer_loss(self, aux_outputs, insts, indices=None):
         """Per layer auxiliary loss.
@@ -164,7 +181,7 @@ class InstanceCriterion:
             cls_losses.append(F.cross_entropy(
                 cls_pred, cls_target, cls_pred.new_tensor(self.class_weight)))
         cls_loss = torch.mean(torch.stack(cls_losses))
-
+        
         # 3 other losses
         score_losses, mask_bce_losses, mask_dice_losses = [], [], []
         for mask, score, inst, (idx_q, idx_gt) in zip(pred_masks, pred_scores,
@@ -222,7 +239,7 @@ class InstanceCriterion:
         return loss
 
     # todo: refactor pred to InstanceData_
-    def __call__(self, pred, insts):
+    def __call__(self, pred, insts, weights):
         """Loss main function.
 
         Args:
@@ -269,6 +286,17 @@ class InstanceCriterion:
             cls_losses.append(F.cross_entropy(
                 cls_pred, cls_target, cls_pred.new_tensor(self.class_weight)))
         cls_loss = torch.mean(torch.stack(cls_losses))
+        # emo_losses = []
+        # for cls_pred, inst, (idx_q, idx_gt) in zip(cls_preds, insts, indices):
+        #     n_classes = cls_pred.shape[1] - 1
+        #     cls_target = cls_pred.new_full((len(cls_pred),), n_classes, dtype=torch.long)
+        #     cls_target[idx_q] = inst.labels_3d[idx_gt]
+        #     emo_loss = self.compute_emo_loss(cls_pred, cls_target,weights=weights)
+        #     mle_loss = F.cross_entropy(cls_pred, cls_target, cls_pred.new_tensor(self.class_weight))
+        #     loss = 0.5 * (mle_loss / (emo_loss+1e-10)).detach() * emo_loss + mle_loss * 0.5
+        #     loss = loss.mean()
+        #     emo_losses.append(loss)
+        # cls_loss = torch.mean(torch.stack(emo_losses))
 
         # 3 other losses
         score_losses, mask_bce_losses, mask_dice_losses = [], [], []

@@ -98,7 +98,7 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         # self.adaptmlp = Adapter(dropout=0.1, d_model=dim)
 
-    def forward(self, x,temp=1.0):
+    def forward(self, x, temp=1.0):
         # b,n,c
         x = x + self.drop_path(self.attn(self.norm1(x), temp=temp))
         residual = x
@@ -108,3 +108,42 @@ class Block(nn.Module):
         # parallel
         x = x + residual
         return x
+    
+    def calculate_emo_loss(self, patch_embeds):
+        """
+        计算 Patch Tokens 的 EMD 损失
+        输入: patch_embeds [B, N, C] (N为Patch数量)
+        输出: EMO 损失标量
+        """
+        B, N, C = patch_embeds.shape
+        
+        # 1. 构造目标分布（均匀分布或其他先验）
+        target_dist = torch.ones(B, N, device=patch_embeds.device) / N  # [B, N]
+        
+        # 2. 计算成本矩阵（Patch 间余弦距离）
+        patch_norm = patch_embeds / torch.norm(patch_embeds, dim=-1, keepdim=True)
+        cost_matrix = torch.bmm(patch_norm, patch_norm.transpose(1, 2))  # [B, N, N]
+        
+        # 3. 用 Sinkhorn 算法近似 EMD
+        emd_loss = self.sinkhorn_emd(cost_matrix, target_dist)
+        return emd_loss.mean()  # 批次平均
+
+    def sinkhorn_emd(self, cost_matrix, target_dist, epsilon=0.1, n_iters=5):
+        """
+        Sinkhorn 迭代求解 EMD
+        输入: cost_matrix [B, N, N], target_dist [B, N]
+        输出: EMD 损失 [B]
+        """
+        log_target = torch.log(target_dist + 1e-8)
+        log_transport = -cost_matrix / epsilon  # 初始化为成本矩阵的负值
+        
+        for _ in range(n_iters):
+            # 行归一化（保证每行是一个分布）
+            log_transport = log_transport - torch.logsumexp(log_transport, dim=2, keepdim=True)
+            # 列归一化（逼近目标分布）
+            log_transport = log_transport - torch.logsumexp(log_transport, dim=1, keepdim=True) + log_target.unsqueeze(1)
+        
+        # 计算最终传输计划
+        transport_plan = torch.exp(log_transport)
+        emd = torch.sum(transport_plan * cost_matrix, dim=(1, 2))
+        return emd

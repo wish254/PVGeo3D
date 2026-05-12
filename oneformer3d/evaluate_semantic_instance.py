@@ -6,6 +6,114 @@ import numpy as np
 
 from mmdet3d.evaluation.functional.scannet_utils import util_3d
 
+import numpy as np
+
+def evaluate_matches_soft(matches, class_labels, options):
+    """Evaluate instance segmentation with soft precision-recall.
+
+    Args:
+        matches (dict): GT to Pred matches.
+        class_labels (tuple[str]): Class names.
+        options (dict): Evaluation options.
+
+    Returns:
+        np.array: Soft-AP scores for all thresholds and categories.
+    """
+    overlaps = options['overlaps']
+    min_region_sizes = [options['min_region_sizes'][0]]
+    dist_threshes = [options['distance_threshes'][0]]
+    dist_confs = [options['distance_confs'][0]]
+
+    ap = np.zeros((len(dist_threshes), len(class_labels), len(overlaps)), float)
+    pr_rc = np.zeros((2, len(class_labels), len(overlaps)), float)
+
+    for di, (min_region_size, distance_thresh, distance_conf) in enumerate(
+        zip(min_region_sizes, dist_threshes, dist_confs)):
+
+        for oi, overlap_th in enumerate(overlaps):
+            for li, label_name in enumerate(class_labels):
+                y_true = np.empty(0)
+                y_score = np.empty(0)
+                has_gt = False
+                has_pred = False
+
+                for m in matches:
+                    pred_instances = matches[m]['pred'][label_name]
+                    gt_instances = matches[m]['gt'][label_name]
+
+                    gt_instances = [
+                        gt for gt in gt_instances
+                        if gt['vert_count'] >= min_region_size and
+                           gt['med_dist'] <= distance_thresh and
+                           gt['dist_conf'] >= distance_conf
+                    ]
+
+                    if gt_instances:
+                        has_gt = True
+                    if pred_instances:
+                        has_pred = True
+
+                    # GT → Pred soft match
+                    for gt in gt_instances:
+                        for pred in gt['matched_pred']:
+                            iou = float(pred['intersection']) / (
+                                gt['vert_count'] + pred['vert_count'] - pred['intersection'] + 1e-6)
+                            confidence = pred['confidence']
+                            soft_tp = iou * confidence
+                            y_true = np.append(y_true, soft_tp)
+                            y_score = np.append(y_score, confidence)
+
+                    # Pred → unmatched → soft FP
+                    for pred in pred_instances:
+                        matched_ious = []
+                        for gt in pred['matched_gt']:
+                            iou = float(gt['intersection']) / (
+                                gt['vert_count'] + pred['vert_count'] - gt['intersection'] + 1e-6)
+                            matched_ious.append(iou)
+
+                        max_iou = max(matched_ious) if matched_ious else 0.0
+                        confidence = pred['confidence']
+                        soft_fp = (1 - max_iou) * confidence
+                        y_true = np.append(y_true, 0.0)  # soft FP contributes 0 to TP
+                        y_score = np.append(y_score, confidence)
+
+                if has_gt and has_pred:
+                    score_arg_sort = np.argsort(-y_score)
+                    y_score_sorted = y_score[score_arg_sort]
+                    y_true_sorted = y_true[score_arg_sort]
+                    cum_tp = np.cumsum(y_true_sorted)
+                    cum_fp = np.cumsum(1 - y_true_sorted)
+                    precision = cum_tp / (cum_tp + cum_fp + 1e-8)
+                    recall = cum_tp / (np.sum(y_true) + 1e-8)
+
+                    precision = np.append(precision, 1.0)
+                    recall = np.append(recall, 0.0)
+
+                    f1 = 2 * precision * recall / (precision + recall + 1e-6)
+                    best_f1_idx = np.argmax(f1)
+                    best_pr = precision[best_f1_idx]
+                    best_rc = recall[best_f1_idx]
+
+                    # Integrate PR to get soft-AP
+                    recall_for_conv = np.copy(recall)
+                    recall_for_conv = np.append(recall_for_conv[0], recall_for_conv)
+                    recall_for_conv = np.append(recall_for_conv, 0.)
+                    stepWidths = np.convolve(recall_for_conv, [-0.5, 0, 0.5], 'valid')
+                    ap_current = np.dot(precision, stepWidths)
+                elif has_gt:
+                    ap_current = 0.0
+                    best_pr = 0.0
+                    best_rc = 0.0
+                else:
+                    ap_current = float('nan')
+                    best_pr = float('nan')
+                    best_rc = float('nan')
+
+                ap[di, li, oi] = ap_current
+                pr_rc[0, li, oi] = best_pr
+                pr_rc[1, li, oi] = best_rc
+
+    return ap, pr_rc
 
 def evaluate_matches(matches, class_labels, options):
     """Evaluate instance segmentation from matched gt and predicted instances
@@ -73,7 +181,8 @@ def evaluate_matches(matches, class_labels, options):
                                 gt['vert_count'] + pred['vert_count'] -
                                 pred['intersection'])
                             if overlap > overlap_th:
-                                confidence = pred['confidence']
+                                confidence = np.clip(pred['confidence'], 0, 1) ** 1
+
                                 # if already have a prediction for this gt,
                                 # the prediction with the lower score is automatically a false positive # noqa
                                 if cur_match[gti]:
@@ -184,6 +293,7 @@ def evaluate_matches(matches, class_labels, options):
                     stepWidths = np.convolve(recall_for_conv, [-0.5, 0, 0.5],
                                              'valid')
                     # integrate is now simply a dot product
+                    # precision = np.maximum.accumulate(precision[::-1])[::-1]  # monotonic decreasing precision
                     ap_current = np.dot(precision, stepWidths)
 
                 elif has_gt:

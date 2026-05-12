@@ -74,7 +74,7 @@ model = dict(
 
 # dataset settings
 dataset_type = 'S3DISSegDataset_'
-data_root = 'data/s3dis/'
+data_root = '/mnt/d/s3dis/'
 data_prefix = dict(
     pts='points',
     pts_instance_mask='instance_mask',
@@ -151,7 +151,7 @@ test_pipeline = [
 
 # run settings
 train_dataloader = dict(
-    batch_size=2,
+    batch_size=1,
     num_workers=3,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -222,7 +222,7 @@ default_hooks = dict(
         save_best=['all_ap_50%', 'miou'],
         rule='greater'))
 
-load_from = 'work_dirs/tmp/instance-only-oneformer3d_1xb2_scannet-and-structured3d.pth'
+load_from = '/root/wish/oneformer3d_main/instance-only-oneformer3d_1xb2_scannet-and-structured3d.pth'
 
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=512, val_interval=16)
 val_cfg = dict(type='ValLoop')

@@ -1,13 +1,28 @@
+import os
+import cv2
+import pickle
+import numpy as np
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import MinkowskiEngine as ME
 import spconv.pytorch as spconv
 from torch_scatter import scatter_mean
-import MinkowskiEngine as ME
+
+import open3d as o3d
+from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import PointData
 from mmdet3d.models import Base3DDetector
 from .mask_matrix_nms import mask_matrix_nms
+from val import get_total_vram_usage
+import sys
+sys.path.append("/root/wish/oneformer3d_main/segment-anything")
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
 
 class ScanNetOneFormer3DMixin:
@@ -175,55 +190,30 @@ class ScanNetOneFormer3DMixin:
         return sem_map, inst_map
     
     def _select_queries(self, x, gt_instances):
-        """Select queries based on EMO cost function (instead of random).
-        
-        Args:
-            x (List[Tensor]): [batch_size, n_points, n_channels]
-            gt_instances (List[InstanceData_]): Ground truth with `labels` and `sp_masks`.
-            
-        Returns:
-            Tuple[List[Tensor], List[InstanceData_]]: Selected queries and updated masks.
-        """
         queries = []
         for i in range(len(x)):
-            points = x[i]  # [n_points, n_channels]
-            sp_masks = gt_instances[i].sp_masks  # [n_gts, n_points]
+            # Apply self-attention to get importance scores
+            self_attn_output, _ = self.self_attn(x[i].unsqueeze(1), x[i].unsqueeze(1), x[i].unsqueeze(1))
+            self_attn_output = self.self_attn_norm(self_attn_output.squeeze(1) + x[i])
+            self_attn_output = self.self_attn_linear(self_attn_output)
             
-            # 1. 计算成本矩阵（点间差异越大，成本越高）
-            cost_matrix = self._compute_emo_cost(points)  # [n_points, n_points]
+            # Calculate importance scores from self-attention output
+            importance_scores = F.softmax(self_attn_output, dim=0)
+            importance_scores = importance_scores.mean(dim=1, keepdim=True)
             
-            # 2. 选点策略：选择与其他点差异最大的Top-K点
             if self.query_thr < 1:
-                n = int((1 - self.query_thr) * len(points))
-                n = min(n, 2000)  # 上限2000
-                selected_ids = self._select_by_cost(cost_matrix, n)
+                # Dynamically adjust the number of queries based on importance scores
+                n = int(self.query_selection_threshold * len(x[i]))
+                # Sample points based on importance scores
+                ids = torch.multinomial(importance_scores.squeeze(), n, replacement=False)
+                queries.append(x[i][ids])
+                gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
             else:
-                selected_ids = torch.arange(len(points), device=points.device)
-            
-            # 3. 保存结果
-            queries.append(points[selected_ids])
-            gt_instances[i].query_masks = sp_masks[:, selected_ids]
+                queries.append(x[i])
+                gt_instances[i].query_masks = gt_instances[i].sp_masks
         
         return queries, gt_instances
 
-    def _compute_emo_cost(self, points):
-        """计算点之间的EMO成本矩阵（越大表示差异越大）"""
-        # 归一化特征
-        points_norm = points / (torch.norm(points, dim=1, keepdim=True) + 1e-6)
-        # 余弦距离矩阵（1 - 相似度）
-        cost_matrix = 1 - torch.mm(points_norm, points_norm.T)  # [n_points, n_points]
-        return cost_matrix
-
-    def _select_by_cost(self, cost_matrix, n):
-        """根据成本矩阵选择最具区分度的n个点"""
-        # 策略1：选择与其他点平均差异最大的点
-        point_importance = cost_matrix.mean(dim=1)  # [n_points]
-        selected_ids = torch.topk(point_importance, n).indices
-        
-        # 策略2（可选）：用Sinkhorn算法优化全局分布
-        # selected_ids = self._sinkhorn_selection(cost_matrix, n)
-        
-        return selected_ids
 
 @MODELS.register_module()
 class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
@@ -277,6 +267,86 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self._init_layers(in_channels, num_channels)
+
+        self.scannet_colormap = np.array([
+                    [0.5, 0.5, 0.5],  # 背景色（灰色）
+                    [174/255, 199/255, 232/255], [152/255, 223/255, 138/255],
+                    [31/255, 119/255, 180/255], [255/255, 187/255, 120/255],
+                    [188/255, 189/255, 34/255], [140/255, 86/255, 75/255],
+                    [255/255, 152/255, 150/255], [214/255, 39/255, 40/255],
+                    [197/255, 176/255, 213/255], [148/255, 103/255, 189/255],
+                    [196/255, 156/255, 148/255], [23/255, 190/255, 207/255],
+                    [247/255, 182/255, 210/255], [219/255, 219/255, 141/255],
+                    [255/255, 127/255, 14/255], [158/255, 218/255, 229/255],
+                    [44/255, 160/255, 44/255], [112/255, 128/255, 144/255],
+                    [227/255, 119/255, 194/255]
+                ])
+        self.query_thr = query_thr
+        self.hidden_dim = in_channels
+        
+        # Self-Attention Mechanism
+        self.self_attn = torch.nn.MultiheadAttention(embed_dim=32, num_heads=8)
+        
+        # Linear layer for processing
+        self.self_attn_linear = torch.nn.Linear(32, 32)
+        
+        # Layer normalization
+        self.self_attn_norm = torch.nn.LayerNorm(32)
+        
+        # Query selection threshold adjustment
+        self.query_selection_threshold = torch.nn.Parameter(torch.tensor(query_thr))
+        
+        self.sample_img_num = 6
+        self.position_embedding = torch.nn.Sequential(
+            nn.Linear(12, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.LayerNorm(256)
+        )
+        #创建sam模型
+        sam_checkpoint = "/root/wish/oneformer3d_main/sam_vit_l_0b3195.pth"
+        model_type = "vit_l"
+        device = "cuda"
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
+        self.mask_generator = SamAutomaticMaskGenerator(sam)
+
+    def _select_queries(self, x, gt_instances):
+        queries = []
+        for i in range(len(x)):
+            # Apply self-attention to get importance scores
+            self_attn_output, _ = self.self_attn(x[i].unsqueeze(1), x[i].unsqueeze(1), x[i].unsqueeze(1))
+            self_attn_output = self.self_attn_norm(self_attn_output.squeeze(1) + x[i])
+            self_attn_output = self.self_attn_linear(self_attn_output)
+            
+            # Calculate importance scores from self-attention output
+            importance_scores = F.softmax(self_attn_output, dim=0)
+            importance_scores = importance_scores.mean(dim=1, keepdim=True)
+            # print(importance_scores)
+            # Adjust importance scores based on class labels
+            # class_weights = self.calculate_class_weights(gt_instances[i].labels_3d)
+            # importance_scores = importance_scores * class_weights.unsqueeze(1).t()
+            
+            if self.query_thr < 1:
+                # Dynamically adjust the number of queries based on importance scores
+                n = int(self.query_selection_threshold * len(x[i]))
+                # Sample points based on importance scores
+                ids = torch.multinomial(importance_scores.squeeze(), n, replacement=False)
+                queries.append(x[i][ids])
+                gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
+            else:
+                queries.append(x[i])
+                gt_instances[i].query_masks = gt_instances[i].sp_masks
+        
+        return queries, gt_instances
+    
+    def calculate_class_weights(self, labels):
+        """Calculate class weights based on label distribution."""
+        unique_labels, counts = torch.unique(labels, return_counts=True)
+        class_weights = 1.0 / counts.float()
+        class_weights = class_weights / class_weights.sum()
+        return class_weights
     
     def _init_layers(self, in_channels, num_channels):
         self.input_conv = spconv.SparseSequential(
@@ -305,11 +375,8 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
             List[Tensor]: of len batch_size,
                 each of shape (n_points_i, n_channels).
         """
-        # x为SparseConvTensor，torch.size([N, 6])
         x = self.input_conv(x)
-        # x为SparseConvTensor，torch.size([N, 32])
         x, _ = self.unet(x)
-        # x为SparseConvTensor，torch.size([N, 32])
         x = self.output_layer(x)
         x = scatter_mean(x.features[inverse_mapping], superpoints, dim=0)
         out = []
@@ -340,9 +407,7 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 [((el_p - el_p.min(0)[0]),
                   torch.hstack((p[:, 3:], p[:, :3] - p[:, :3].mean(0))))
                  for el_p, p in zip(elastic_points, points)])
-       
-        # print(coordinates.shape)
-        # print(features.shape)
+        
         spatial_shape = torch.clip(
             coordinates.max(0)[0][1:] + 1, self.min_spatial_shape)
         field = ME.TensorField(features=features, coordinates=coordinates)
@@ -356,26 +421,105 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
     def _forward(*args, **kwargs):
         """Implement abstract method of Base3DDetector."""
         pass
+    
+    def preprocess_img(self, img_path):
+
+        image = cv2.imread(img_path)
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        return image
+    
+    def show_anns(self, anns):
+        if len(anns) == 0:
+            return
+        sorted_anns = sorted(anns, key=(lambda x: x['area']), reverse=True)
+        ax = plt.gca()
+        ax.set_autoscale_on(False)
+        polygons = []
+        color = []
+        for ann in sorted_anns:
+            m = ann['segmentation']
+            img = np.ones((m.shape[0], m.shape[1], 3))
+            color_mask = np.random.random((1, 3)).tolist()[0]
+            for i in range(3):
+                img[:,:,i] = color_mask[i]
+            ax.imshow(np.dstack((img, m*0.35)))
+
+    def load_pose_to_tensor(self, pose_path):
+        with open(pose_path, 'r') as f:
+            lines = f.readlines()[:3]  
+            values = []
+            for line in lines:
+                values.extend([float(x) for x in line.strip().split()])
+        return torch.tensor(values).reshape(1, 12).to('cuda')
 
     def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Calculate losses from a batch of inputs dict and data samples.
 
         Args:
             batch_inputs_dict (dict): The model input dict which include
-                `points` key.
+                `points` and `elastic_coords` key.
             batch_data_samples (List[:obj:`Det3DDataSample`]): The Data
                 Samples. It includes information such as
                 `gt_instances_3d` and `gt_sem_seg_3d`.
+                (`gt_pts_seg`, `gt_instances_3d`, `eval_ann_info` and `gt_instances`)
         Returns:
             dict: A dictionary of loss components.
         """
+        # self.visualize_instance(batch_inputs_dict, batch_data_samples)
         batch_offsets = [0]
         superpoint_bias = 0
         sp_gt_instances = []
         sp_pts_masks = []
+        total_feat = []
+        feat_tokens = []
+        image_tokens = []
+        pose_tokens = []
         for i in range(len(batch_data_samples)):
+            original_path = batch_data_samples[i].lidar_path
+            img_path = original_path.replace('/points/', '/scans/').replace('.bin', '/color')
+            pose_path = original_path.replace('/points/', '/scans/').replace('.bin', '/pose')
+            all_pose_names = sorted(os.listdir(pose_path), key=lambda x: int(x.split(".")[0]))
+            valid_pose_names = []
+            valid_img_paths = []
+            valid_pose_paths = []
+            for fname in all_pose_names:
+                full_pose_path = os.path.join(pose_path, fname)
+                pose_tensor = self.load_pose_to_tensor(full_pose_path).squeeze(0)
+                if not torch.isinf(pose_tensor).any():
+                    valid_pose_names.append(fname)
+                    valid_pose_paths.append(full_pose_path)
+                    img_name = fname.replace(".txt", ".jpg") 
+                    full_img_path = os.path.join(img_path, img_name)
+                    valid_img_paths.append(full_img_path)
+            if len(valid_pose_names) < self.sample_img_num:
+                raise ValueError(f"Insufficient valid frames: only {len(valid_pose_names)} frames available, but {self.sample_img_num} frames required.")
+            step = len(valid_pose_names) // self.sample_img_num
+            selected_pose_paths = valid_pose_paths[::step][:self.sample_img_num]
+            selected_img_paths = valid_img_paths[::step][:self.sample_img_num]
+            pose_token = torch.stack([self.load_pose_to_tensor(p).squeeze(0) for p in selected_pose_paths], dim=0)
+            img_list = [self.preprocess_img(p) for p in selected_img_paths]
+            pose_token = self.position_embedding(pose_token)
+            processed_feats = []
+            image_tokens_list = []
+            feat_tokens_list = []
+            for img in img_list:
+                feat, image_token = self.mask_generator.generate(img, True)
+                processed_feat = torch.mean(feat, dim=0).reshape(1, -1)
+                processed_feats.append(processed_feat)
+                feat_tokens_list.append(feat)
+                image_tokens_list.append(image_token)
+            # feat_list = [torch.mean(mask_generator.generate(_, True), dim=0).reshape(1,-1) for _ in img_list]
+            feat_list = torch.cat(processed_feats,dim=0)
+            image_tokens_list = torch.cat(image_tokens_list, dim=0)
+            feat_tokens_list = torch.cat(feat_tokens_list, dim=0)
+            total_feat.append(feat_list)
+            feat_tokens.append(feat_tokens_list)
+            image_tokens.append(image_tokens_list)
+            pose_tokens.append(pose_token)
+            del feat_list
             gt_pts_seg = batch_data_samples[i].gt_pts_seg
-
             gt_pts_seg.sp_pts_mask += superpoint_bias
             superpoint_bias = gt_pts_seg.sp_pts_mask.max().item() + 1
             batch_offsets.append(superpoint_bias)
@@ -386,17 +530,220 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         coordinates, features, inverse_mapping, spatial_shape = self.collate(
             batch_inputs_dict['points'],
             batch_inputs_dict.get('elastic_coords', None))
+
         x = spconv.SparseConvTensor(
             features, coordinates, spatial_shape, len(batch_data_samples))
         sp_pts_masks = torch.hstack(sp_pts_masks)
+
         x = self.extract_feat(
             x, sp_pts_masks, inverse_mapping, batch_offsets)
-        queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)    
-        x = self.decoder(x, queries)
-        weights = self.decoder.out_cls[2].weight.data.detach()
-        loss = self.criterion(x, sp_gt_instances, weights)
+        queries, sp_gt_instances = self._select_queries(x, sp_gt_instances)
+        x, distill_loss = self.decoder(x, queries, total_feat, image_tokens, feat_tokens, pose_tokens)
+        loss = self.criterion(x, sp_gt_instances, weights=None)
+        loss['distill_loss'] = distill_loss
+        # saved_files = self.save_training_data(
+        #             batch_inputs_dict, 
+        #             batch_data_samples, 
+        #             x
+        #         )
+        # print(f"Saved training data to: {saved_files}")
         return loss
     
+    # def save_training_data(self, batch_inputs_dict, batch_data_samples, x):  
+    #     """
+    #     保存训练数据到文件
+    #     :param output_dir: 输出目录（自动按时间创建子目录）
+    #     :return: 保存的文件路径列表
+    #     """
+    #     # 创建带时间戳的输出目录
+    #     from datetime import datetime
+    #     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #     save_dir = os.path.join("/root/wish/oneformer3d_main", timestamp)
+    #     os.makedirs(save_dir, exist_ok=True)
+
+    #     saved_files = []
+
+    #     # 1. 保存batch_inputs_dict（点云数据）
+    #     points_data = {
+    #         'points': [tensor.cpu().numpy() for tensor in batch_inputs_dict['points']],
+    #         'elastic_coords': batch_inputs_dict.get('elastic_coords', None)
+    #     }
+    #     points_path = os.path.join(save_dir, "batch_inputs.pkl")
+    #     with open(points_path, 'wb') as f:
+    #         pickle.dump(points_data, f)
+    #     saved_files.append(points_path)
+
+    #     return saved_files
+
+    # def save_predictions(self, batch_data_samples, save_dir="predictions_clean"):
+    #     """
+    #     将 batch_data_samples 中的预测结果安全转换并保存为 .npz 文件
+        
+    #     Args:
+    #         batch_data_samples (list): 模型输出的预测结果集合
+    #         save_dir (str): 保存目录
+    #     """
+    #     os.makedirs(save_dir, exist_ok=True)
+
+    #     def safe_convert(data):
+    #         """增强版类型转换（处理非均匀数据）"""
+    #         if isinstance(data, torch.Tensor):
+    #             return data.detach().cpu().numpy()
+    #         elif isinstance(data, np.ndarray):
+    #             return data
+    #         elif isinstance(data, (list, tuple)):
+    #             if len(data) == 0:
+    #                 return np.array([])
+                
+    #             elem_types = {type(x) for x in data}
+                
+    #             if all(isinstance(x, (int, float)) for x in data):
+    #                 return np.array(data)
+    #             elif all(isinstance(x, (list, tuple, np.ndarray)) for x in data):
+    #                 try:
+    #                     return np.array(data)
+    #                 except ValueError:
+    #                     arr = np.empty(len(data), dtype=object)
+    #                     arr[:] = data
+    #                     return arr
+    #             else:
+    #                 raise ValueError(f"Mixed types in data: {elem_types}")
+    #         else:
+    #             raise TypeError(f"Cannot convert type {type(data)}")
+
+    #     saved_files = []  # 用来返回所有保存的文件路径
+
+    #     for idx, sample in enumerate(batch_data_samples):
+    #         pred = sample.pred_pts_seg
+
+    #         if not hasattr(pred, 'pts_instance_mask'):
+    #             raise AttributeError("pred object missing pts_instance_mask")
+
+    #         try:
+    #             masks = safe_convert(pred.pts_instance_mask)
+    #         except ValueError:
+    #             print(f"Warning: Irregular mask shape in sample {idx}, using object array")
+    #             masks = np.array(pred.pts_instance_mask, dtype=object)
+
+    #         # 获取 lidar_path（可能在 sample 或 sample.metainfo 中）
+    #         lidar_path = getattr(sample, "lidar_path", None)
+    #         if lidar_path is None and hasattr(sample, "metainfo"):
+    #             lidar_path = sample.metainfo.get("lidar_path", "unknown")
+
+    #         data_dict = {
+    #             "labels": safe_convert(pred.instance_labels),
+    #             "scores": safe_convert(pred.instance_scores),
+    #             "masks": masks,
+    #             "meta": {
+    #                 "sample_id": idx,
+    #                 "mask_type": str(type(masks[0])) if len(masks) > 0 else "empty",
+    #                 "lidar_path": lidar_path
+    #             }
+    #         }
+
+    #         save_path = os.path.join(save_dir, f"pred_{idx}.npz")
+    #         np.savez_compressed(save_path, **data_dict)
+    #         saved_files.append(save_path)
+
+    #     return saved_files
+
+    def save_training_data(self, batch_inputs_dict, scene_dir):
+        """
+        保存 batch_inputs_dict 到指定场景目录
+        """
+        os.makedirs(scene_dir, exist_ok=True)
+        points_data = {
+            'points': [tensor.cpu().numpy() for tensor in batch_inputs_dict['points']],
+            'elastic_coords': batch_inputs_dict.get('elastic_coords', None)
+        }
+
+        points_path = os.path.join(scene_dir, "batch_inputs.pkl")
+        with open(points_path, 'wb') as f:
+            pickle.dump(points_data, f)
+        return points_path
+
+    def save_predictions(self, batch_inputs_dict, batch_data_samples):
+        """
+        根据 batch_data_samples 中的 lidar_path 自动创建目录，
+        并保存对应的输入点云和预测结果。
+        """
+        base_dir = "/root/wish/oneformer3d_main/prediction"
+        os.makedirs(base_dir, exist_ok=True)
+
+        def safe_convert(data):
+            """增强版类型转换（处理非均匀数据）"""
+            if isinstance(data, torch.Tensor):
+                return data.detach().cpu().numpy()
+            elif isinstance(data, np.ndarray):
+                return data
+            elif isinstance(data, (list, tuple)):
+                if len(data) == 0:
+                    return np.array([])
+                elem_types = {type(x) for x in data}
+                if all(isinstance(x, (int, float)) for x in data):
+                    return np.array(data)
+                elif all(isinstance(x, (list, tuple, np.ndarray)) for x in data):
+                    try:
+                        return np.array(data)
+                    except ValueError:
+                        arr = np.empty(len(data), dtype=object)
+                        arr[:] = data
+                        return arr
+                else:
+                    raise ValueError(f"Mixed types in data: {elem_types}")
+            else:
+                raise TypeError(f"Cannot convert type {type(data)}")
+
+        saved_files = []
+
+        for idx, sample in enumerate(batch_data_samples):
+            # 1️⃣ 获取场景名
+            lidar_path = getattr(sample, "lidar_path", None)
+            if lidar_path is None and hasattr(sample, "metainfo"):
+                lidar_path = sample.metainfo.get("lidar_path", "unknown")
+            if lidar_path is None:
+                scene_name = f"sample_{idx}"
+            else:
+                scene_name = os.path.splitext(os.path.basename(lidar_path))[0]
+
+            scene_dir = os.path.join(base_dir, scene_name)
+            os.makedirs(scene_dir, exist_ok=True)
+
+            # 2️⃣ 保存输入点云
+            input_path = self.save_training_data(batch_inputs_dict, scene_dir)
+
+            # 3️⃣ 保存预测结果
+            pred = sample.pred_pts_seg
+            if not hasattr(pred, 'pts_instance_mask'):
+                raise AttributeError("pred object missing pts_instance_mask")
+
+            try:
+                masks = safe_convert(pred.pts_instance_mask)
+            except ValueError:
+                print(f"Warning: Irregular mask shape in sample {idx}, using object array")
+                masks = np.array(pred.pts_instance_mask, dtype=object)
+
+            data_dict = {
+                "labels": safe_convert(pred.instance_labels),
+                "scores": safe_convert(pred.instance_scores),
+                "masks": masks,
+                "meta": {
+                    "sample_id": idx,
+                    "lidar_path": lidar_path
+                }
+            }
+
+            pred_path = os.path.join(scene_dir, "pred.npz")
+            np.savez_compressed(pred_path, **data_dict)
+
+            saved_files.append({
+                "scene": scene_name,
+                "input": input_path,
+                "pred": pred_path
+            })
+
+        return saved_files
+
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Predict results from a batch of inputs and data samples with post-
         processing.
@@ -418,10 +765,58 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 - pts_instance_mask (Tensor): Instance mask, has a shape
                     (num_points, num_instances) of type bool.
         """
+        # self.visualize_instance(batch_inputs_dict, batch_data_samples)
         batch_offsets = [0]
         superpoint_bias = 0
+        sp_gt_instances = []
         sp_pts_masks = []
+        total_feat = []
+        feat_tokens = []
+        image_tokens = []
+        pose_tokens = []
         for i in range(len(batch_data_samples)):
+            original_path = batch_data_samples[i].lidar_path
+            img_path = original_path.replace('/points/', '/scans/').replace('.bin', '/color')
+            pose_path = original_path.replace('/points/', '/scans/').replace('.bin', '/pose')
+            all_pose_names = sorted(os.listdir(pose_path), key=lambda x: int(x.split(".")[0]))
+            valid_pose_names = []
+            valid_img_paths = []
+            valid_pose_paths = []
+            for fname in all_pose_names:
+                full_pose_path = os.path.join(pose_path, fname)
+                pose_tensor = self.load_pose_to_tensor(full_pose_path).squeeze(0)
+                if not torch.isinf(pose_tensor).any():
+                    valid_pose_names.append(fname)
+                    valid_pose_paths.append(full_pose_path)
+                    img_name = fname.replace(".txt", ".jpg") 
+                    full_img_path = os.path.join(img_path, img_name)
+                    valid_img_paths.append(full_img_path)
+            if len(valid_pose_names) < self.sample_img_num:
+                raise ValueError(f"Insufficient valid frames: only {len(valid_pose_names)} frames available, but {self.sample_img_num} frames required.")
+            step = len(valid_pose_names) // self.sample_img_num
+            selected_pose_paths = valid_pose_paths[::step][:self.sample_img_num]
+            selected_img_paths = valid_img_paths[::step][:self.sample_img_num]
+            pose_token = torch.stack([self.load_pose_to_tensor(p).squeeze(0) for p in selected_pose_paths], dim=0)
+            img_list = [self.preprocess_img(p) for p in selected_img_paths]
+            pose_token = self.position_embedding(pose_token)
+            processed_feats = []
+            image_tokens_list = []
+            feat_tokens_list = []
+            for img in img_list:
+                feat, image_token = self.mask_generator.generate(img, True)
+                processed_feat = torch.mean(feat, dim=0).reshape(1, -1)
+                processed_feats.append(processed_feat)
+                feat_tokens_list.append(feat)
+                image_tokens_list.append(image_token)
+            # feat_list = [torch.mean(mask_generator.generate(_, True), dim=0).reshape(1,-1) for _ in img_list]
+            feat_list = torch.cat(processed_feats,dim=0)
+            image_tokens_list = torch.cat(image_tokens_list, dim=0)
+            feat_tokens_list = torch.cat(feat_tokens_list, dim=0)
+            total_feat.append(feat_list)
+            feat_tokens.append(feat_tokens_list)
+            image_tokens.append(image_tokens_list)
+            pose_tokens.append(pose_token)
+            del feat_list
             gt_pts_seg = batch_data_samples[i].gt_pts_seg
             gt_pts_seg.sp_pts_mask += superpoint_bias
             superpoint_bias = gt_pts_seg.sp_pts_mask.max().item() + 1
@@ -436,14 +831,16 @@ class ScanNetOneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         sp_pts_masks = torch.hstack(sp_pts_masks)
         x = self.extract_feat(
             x, sp_pts_masks, inverse_mapping, batch_offsets)
-        
-        x = self.decoder(x, x)
+        x, _ = self.decoder(x, x, total_feat, image_tokens, feat_tokens, pose_tokens)
+        # self.save_training_data(batch_inputs_dict, batch_data_samples, x)
         results_list = self.predict_by_feat(x, sp_pts_masks)
         for i, data_sample in enumerate(batch_data_samples):
             data_sample.pred_pts_seg = results_list[i]
+
+        file = self.save_predictions(batch_inputs_dict, batch_data_samples)
+        print("保存的文件列表:", file)
         return batch_data_samples
-
-
+ 
 @MODELS.register_module()
 class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
     """OneFormer3D for ScanNet200 dataset.
@@ -493,6 +890,35 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         self.query_thr = query_thr
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
+        self.sample_img_num = 6
+        self.position_embedding = torch.nn.Sequential(
+            nn.Linear(12, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.LayerNorm(256)
+        )
+        self.query_thr = query_thr
+        
+        # Self-Attention Mechanism
+        self.self_attn = torch.nn.MultiheadAttention(embed_dim=96, num_heads=8)
+        
+        # Linear layer for processing
+        self.self_attn_linear = torch.nn.Linear(96, 96)
+        
+        # Layer normalization
+        self.self_attn_norm = torch.nn.LayerNorm(96)
+        
+        # Query selection threshold adjustment
+        self.query_selection_threshold = torch.nn.Parameter(torch.tensor(query_thr))
+        #创建sam模型
+        sam_checkpoint = "/root/wish/oneformer3d_main/sam_vit_h_4b8939.pth"
+        model_type = "vit_h"
+        device = "cuda"
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
+        self.mask_generator = SamAutomaticMaskGenerator(sam)
+        self.sample_img_num = 6
 
     def extract_feat(self, batch_inputs_dict, batch_data_samples):
         """Extract features from sparse tensor.
@@ -552,6 +978,29 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         """Implement abstract method of Base3DDetector."""
         pass
 
+    def preprocess_img(self, img_path):
+
+        image = cv2.imread(img_path)
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        return image
+
+    def calculate_class_weights(self, labels):
+        """Calculate class weights based on label distribution."""
+        unique_labels, counts = torch.unique(labels, return_counts=True)
+        class_weights = 1.0 / counts.float()
+        class_weights = class_weights / class_weights.sum()
+        return class_weights
+    
+    def load_pose_to_tensor(self, pose_path):
+        with open(pose_path, 'r') as f:
+            lines = f.readlines()[:3]  
+            values = []
+            for line in lines:
+                values.extend([float(x) for x in line.strip().split()])
+        return torch.tensor(values).reshape(1, 12).to('cuda')
+
     def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Calculate losses from a batch of inputs dict and data samples.
 
@@ -564,11 +1013,61 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
         Returns:
             dict: A dictionary of loss components.
         """
+        total_feat = []
+        feat_tokens = []
+        image_tokens = []
+        pose_tokens = []
+        for i in range(len(batch_data_samples)):
+            original_path = batch_data_samples[i].lidar_path
+            img_path = original_path.replace('/ScanNet200/', '/ScanNet V2/').replace('/points/', '/scans/').replace('.bin', '/color')
+            pose_path = original_path.replace('/ScanNet200/', '/ScanNet V2/').replace('/points/', '/scans/').replace('.bin', '/pose')
+            all_pose_names = sorted(os.listdir(pose_path), key=lambda x: int(x.split(".")[0]))
+            valid_pose_names = []
+            valid_img_paths = []
+            valid_pose_paths = []
+            for fname in all_pose_names:
+                full_pose_path = os.path.join(pose_path, fname)
+                pose_tensor = self.load_pose_to_tensor(full_pose_path).squeeze(0)
+                if not torch.isinf(pose_tensor).any():
+                    valid_pose_names.append(fname)
+                    valid_pose_paths.append(full_pose_path)
+                    img_name = fname.replace(".txt", ".jpg") 
+                    full_img_path = os.path.join(img_path, img_name)
+                    valid_img_paths.append(full_img_path)
+            if len(valid_pose_names) < self.sample_img_num:
+                raise ValueError(f"Insufficient valid frames: only {len(valid_pose_names)} frames available, but {self.sample_img_num} frames required.")
+            step = len(valid_pose_names) // self.sample_img_num
+            selected_pose_paths = valid_pose_paths[::step][:self.sample_img_num]
+            selected_img_paths = valid_img_paths[::step][:self.sample_img_num]
+            pose_token = torch.stack([self.load_pose_to_tensor(p).squeeze(0) for p in selected_pose_paths], dim=0)
+            img_list = [self.preprocess_img(p) for p in selected_img_paths]
+
+            pose_token = self.position_embedding(pose_token)
+            processed_feats = []
+            image_tokens_list = []
+            feat_tokens_list = []
+            for img in img_list:
+                feat, image_token = self.mask_generator.generate(img, True)
+                processed_feat = torch.mean(feat, dim=0).reshape(1, -1)
+                processed_feats.append(processed_feat)
+                feat_tokens_list.append(feat)
+                image_tokens_list.append(image_token)
+            # feat_list = [torch.mean(mask_generator.generate(_, True), dim=0).reshape(1,-1) for _ in img_list]
+            feat_list = torch.cat(processed_feats,dim=0)
+            image_tokens_list = torch.cat(image_tokens_list, dim=0)
+            feat_tokens_list = torch.cat(feat_tokens_list, dim=0)
+            total_feat.append(feat_list)
+            feat_tokens.append(feat_tokens_list)
+            image_tokens.append(image_tokens_list)
+            pose_tokens.append(pose_token)
+            del feat_list
         x = self.extract_feat(batch_inputs_dict, batch_data_samples)
         gt_instances = [s.gt_instances_3d for s in batch_data_samples]
         queries, gt_instances = self._select_queries(x, gt_instances)
-        x = self.decoder(x, queries)
-        return self.criterion(x, gt_instances)
+        x, distill_loss = self.decoder(x, queries, total_feat, image_tokens, feat_tokens, pose_tokens)
+        loss = self.criterion(x, gt_instances, weights=None)
+        loss['distill_loss'] = distill_loss
+        return loss
 
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Predict results from a batch of inputs and data samples with post-
@@ -591,9 +1090,57 @@ class ScanNet200OneFormer3D(ScanNetOneFormer3DMixin, Base3DDetector):
                 - pts_instance_mask (Tensor): Instance mask, has a shape
                     (num_points, num_instances) of type bool.
         """
+        total_feat = []
+        feat_tokens = []
+        image_tokens = []
+        pose_tokens = []
+        for i in range(len(batch_data_samples)):
+            original_path = batch_data_samples[i].lidar_path
+            img_path = original_path.replace('/ScanNet200/', '/ScanNet V2/').replace('/points/', '/scans/').replace('.bin', '/color')
+            pose_path = original_path.replace('/ScanNet200/', '/ScanNet V2/').replace('/points/', '/scans/').replace('.bin', '/pose')
+            all_pose_names = sorted(os.listdir(pose_path), key=lambda x: int(x.split(".")[0]))
+            valid_pose_names = []
+            valid_img_paths = []
+            valid_pose_paths = []
+            for fname in all_pose_names:
+                full_pose_path = os.path.join(pose_path, fname)
+                pose_tensor = self.load_pose_to_tensor(full_pose_path).squeeze(0)
+                if not torch.isinf(pose_tensor).any():
+                    valid_pose_names.append(fname)
+                    valid_pose_paths.append(full_pose_path)
+                    img_name = fname.replace(".txt", ".jpg") 
+                    full_img_path = os.path.join(img_path, img_name)
+                    valid_img_paths.append(full_img_path)
+            if len(valid_pose_names) < self.sample_img_num:
+                raise ValueError(f"Insufficient valid frames: only {len(valid_pose_names)} frames available, but {self.sample_img_num} frames required.")
+            step = len(valid_pose_names) // self.sample_img_num
+            selected_pose_paths = valid_pose_paths[::step][:self.sample_img_num]
+            selected_img_paths = valid_img_paths[::step][:self.sample_img_num]
+            pose_token = torch.stack([self.load_pose_to_tensor(p).squeeze(0) for p in selected_pose_paths], dim=0)
+            img_list = [self.preprocess_img(p) for p in selected_img_paths]
+
+            pose_token = self.position_embedding(pose_token)
+            processed_feats = []
+            image_tokens_list = []
+            feat_tokens_list = []
+            for img in img_list:
+                feat, image_token = self.mask_generator.generate(img, True)
+                processed_feat = torch.mean(feat, dim=0).reshape(1, -1)
+                processed_feats.append(processed_feat)
+                feat_tokens_list.append(feat)
+                image_tokens_list.append(image_token)
+            # feat_list = [torch.mean(mask_generator.generate(_, True), dim=0).reshape(1,-1) for _ in img_list]
+            feat_list = torch.cat(processed_feats,dim=0)
+            image_tokens_list = torch.cat(image_tokens_list, dim=0)
+            feat_tokens_list = torch.cat(feat_tokens_list, dim=0)
+            total_feat.append(feat_list)
+            feat_tokens.append(feat_tokens_list)
+            image_tokens.append(image_tokens_list)
+            pose_tokens.append(pose_token)
+            del feat_list
         assert len(batch_data_samples) == 1
         x = self.extract_feat(batch_inputs_dict, batch_data_samples)
-        x = self.decoder(x, x)
+        x, _ = self.decoder(x, x, total_feat, image_tokens, feat_tokens, pose_tokens)
         pred_pts_seg = self.predict_by_feat(
             x, batch_data_samples[0].gt_pts_seg.sp_pts_mask)
         batch_data_samples[0].pred_pts_seg = pred_pts_seg[0]
@@ -648,6 +1195,31 @@ class S3DISOneFormer3D(Base3DDetector):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self._init_layers(in_channels, num_channels)
+        self.sample_img_num = 6
+        self.query_thr = 0.5
+        # Self-Attention Mechanism
+        self.self_attn = torch.nn.MultiheadAttention(embed_dim=64, num_heads=8)
+        # Linear layer for processing
+        self.self_attn_linear = torch.nn.Linear(64, 64)
+        
+        # Layer normalization
+        self.self_attn_norm = torch.nn.LayerNorm(64)
+        
+        # Query selection threshold adjustment
+        self.query_selection_threshold = torch.nn.Parameter(torch.tensor(0.5))
+        sam_checkpoint = "/root/wish/oneformer3d_main/sam_vit_b_01ec64.pth"
+        model_type = "vit_b"
+        device = "cuda"
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
+        self.mask_generator = SamAutomaticMaskGenerator(sam)
+        self.position_embedding = torch.nn.Sequential(
+            nn.Linear(12, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.LayerNorm(256)
+        )
 
     def _init_layers(self, in_channels, num_channels):
         self.input_conv = spconv.SparseSequential(
@@ -661,7 +1233,46 @@ class S3DISOneFormer3D(Base3DDetector):
         self.output_layer = spconv.SparseSequential(
             torch.nn.BatchNorm1d(num_channels, eps=1e-4, momentum=0.1),
             torch.nn.ReLU(inplace=True))
+        
+    def preprocess_img(self, img_path):
 
+        image = cv2.imread(img_path)
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        return image
+    
+    def _select_queries(self, x, gt_instances):
+        queries = []
+        for i in range(len(x)):
+            # Apply self-attention to get importance scores
+            self_attn_output, _ = self.self_attn(x[i].unsqueeze(1), x[i].unsqueeze(1), x[i].unsqueeze(1))
+            self_attn_output = self.self_attn_norm(self_attn_output.squeeze(1) + x[i])
+            self_attn_output = self.self_attn_linear(self_attn_output)
+            
+            # Calculate importance scores from self-attention output
+            importance_scores = F.softmax(self_attn_output, dim=0)
+            importance_scores = importance_scores.mean(dim=1, keepdim=True)
+            
+            if self.query_thr < 1:
+                # Dynamically adjust the number of queries based on importance scores
+                n = int(self.query_selection_threshold * len(x[i]))
+                # Sample points based on importance scores
+                ids = torch.multinomial(importance_scores.squeeze(), n, replacement=False)
+                queries.append(x[i][ids])
+                gt_instances[i].query_masks = gt_instances[i].sp_masks[:, ids]
+            else:
+                queries.append(x[i])
+                gt_instances[i].query_masks = gt_instances[i].sp_masks
+        return queries, gt_instances
+
+    def calculate_class_weights(self, labels):
+        """Calculate class weights based on label distribution."""
+        unique_labels, counts = torch.unique(labels, return_counts=True)
+        class_weights = 1.0 / counts.float()
+        class_weights = class_weights / class_weights.sum()
+        return class_weights
+    
     def extract_feat(self, x):
         """Extract features from sparse tensor.
 
@@ -719,6 +1330,14 @@ class S3DISOneFormer3D(Base3DDetector):
         """Implement abstract method of Base3DDetector."""
         pass
 
+    def load_pose_to_tensor(self, pose_path):
+        with open(pose_path, 'r') as f:
+            lines = f.readlines()[:3]  
+            values = []
+            for line in lines:
+                values.extend([float(x) for x in line.strip().split()])
+        return torch.tensor(values).reshape(1, 12).to('cuda')
+
     def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Calculate losses from a batch of inputs dict and data samples.
 
@@ -731,17 +1350,71 @@ class S3DISOneFormer3D(Base3DDetector):
         Returns:
             dict: A dictionary of loss components.
         """
+        total_feat = []
+        feat_tokens = []
+        image_tokens = []
+        pose_tokens = []
+        for i in range(len(batch_data_samples)):
+            original_path = batch_data_samples[i].lidar_path
+            filename = os.path.splitext(os.path.basename(original_path))[0]  # "Area_1_office_5"
+            area, room = filename.split('_', maxsplit=2)[:2], filename.split('_', maxsplit=2)[2]
+            area = '_'.join([area[0], area[1]])  # "Area_1"
+            room = room  # "office_5"
 
+            # 2. 拼接目标路径
+            target_path = os.path.join(
+                "/mnt/d/s3dis/Stanford3dDataset_v1.2_Aligned_Version",
+                area,
+                room
+            )
+            img_path = os.path.join(target_path, "rgb")
+            pose_path = os.path.join(target_path, "pose")
+            all_pose_names = sorted(os.listdir(pose_path), key=lambda x: int(x.split(".")[0]))
+            valid_pose_names = []
+            valid_img_paths = []
+            valid_pose_paths = []
+            for fname in all_pose_names:
+                full_pose_path = os.path.join(pose_path, fname)
+                pose_tensor = self.load_pose_to_tensor(full_pose_path).squeeze(0)
+                if not torch.isinf(pose_tensor).any():
+                    valid_pose_names.append(fname)
+                    valid_pose_paths.append(full_pose_path)
+                    img_name = fname.replace(".txt", ".jpg") 
+                    full_img_path = os.path.join(img_path, img_name)
+                    valid_img_paths.append(full_img_path)
+            if len(valid_pose_names) < self.sample_img_num:
+                raise ValueError(f"Insufficient valid frames: only {len(valid_pose_names)} frames available, but {self.sample_img_num} frames required.")
+            step = len(valid_pose_names) // self.sample_img_num
+            selected_pose_paths = valid_pose_paths[::step][:self.sample_img_num]
+            selected_img_paths = valid_img_paths[::step][:self.sample_img_num]
+            pose_token = torch.stack([self.load_pose_to_tensor(p).squeeze(0) for p in selected_pose_paths], dim=0)
+            img_list = [self.preprocess_img(p) for p in selected_img_paths]
+
+            pose_token = self.position_embedding(pose_token)
+            processed_feats = []
+            image_tokens_list = []
+            feat_tokens_list = []
+            for img in img_list:
+                feat, image_token = self.mask_generator.generate(img, True)
+                processed_feat = torch.mean(feat, dim=0).reshape(1, -1)
+                processed_feats.append(processed_feat)
+                feat_tokens_list.append(feat)
+                image_tokens_list.append(image_token)
+            feat_list = torch.cat(processed_feats,dim=0)
+            image_tokens_list = torch.cat(image_tokens_list, dim=0)
+            feat_tokens_list = torch.cat(feat_tokens_list, dim=0)
+            total_feat.append(feat_list)
+            feat_tokens.append(feat_tokens_list)
+            image_tokens.append(image_tokens_list)
+            pose_tokens.append(pose_token)
+            del feat_list
         coordinates, features, inverse_mapping, spatial_shape = self.collate(
             batch_inputs_dict['points'],
             batch_inputs_dict.get('elastic_coords', None))
         x = spconv.SparseConvTensor(
             features, coordinates, spatial_shape, len(batch_data_samples))
-
         x = self.extract_feat(x)
-
-        x = self.decoder(x)
-
+        x, distill_loss = self.decoder(x, None, total_feat, image_tokens, feat_tokens, pose_tokens)
         sp_gt_instances = []
         for i in range(len(batch_data_samples)):
             voxel_superpoints = inverse_mapping[coordinates[:, 0][ \
@@ -760,8 +1433,8 @@ class S3DISOneFormer3D(Base3DDetector):
                                 self.get_gt_inst_masks(inst_mask,
                                                        voxel_superpoints)
             sp_gt_instances.append(batch_data_samples[i].gt_instances_3d)
-
         loss = self.criterion(x, sp_gt_instances)
+        loss['distill_loss'] = distill_loss
         return loss
 
     def predict(self, batch_inputs_dict, batch_data_samples, **kwargs):
@@ -784,7 +1457,64 @@ class S3DISOneFormer3D(Base3DDetector):
                 - pts_instance_mask (Tensor): Instance mask, has a shape
                     (num_points, num_instances) of type bool.
         """
+        total_feat = []
+        feat_tokens = []
+        image_tokens = []
+        pose_tokens = []
+        for i in range(len(batch_data_samples)):
+            original_path = batch_data_samples[i].lidar_path
+            filename = os.path.splitext(os.path.basename(original_path))[0]  # "Area_1_office_5"
+            area, room = filename.split('_', maxsplit=2)[:2], filename.split('_', maxsplit=2)[2]
+            area = '_'.join([area[0], area[1]])  # "Area_1"
+            room = room  # "office_5"
+            # 2. 拼接目标路径
+            target_path = os.path.join(
+                "/mnt/d/s3dis/Stanford3dDataset_v1.2_Aligned_Version",
+                area,
+                room
+            )
+            img_path = os.path.join(target_path, "rgb")
+            pose_path = os.path.join(target_path, "pose")
+            all_pose_names = sorted(os.listdir(pose_path), key=lambda x: int(x.split(".")[0]))
+            valid_pose_names = []
+            valid_img_paths = []
+            valid_pose_paths = []
+            for fname in all_pose_names:
+                full_pose_path = os.path.join(pose_path, fname)
+                pose_tensor = self.load_pose_to_tensor(full_pose_path).squeeze(0)
+                if not torch.isinf(pose_tensor).any():
+                    valid_pose_names.append(fname)
+                    valid_pose_paths.append(full_pose_path)
+                    img_name = fname.replace(".txt", ".jpg") 
+                    full_img_path = os.path.join(img_path, img_name)
+                    valid_img_paths.append(full_img_path)
+            if len(valid_pose_names) < self.sample_img_num:
+                raise ValueError(f"Insufficient valid frames: only {len(valid_pose_names)} frames available, but {self.sample_img_num} frames required.")
+            step = len(valid_pose_names) // self.sample_img_num
+            selected_pose_paths = valid_pose_paths[::step][:self.sample_img_num]
+            selected_img_paths = valid_img_paths[::step][:self.sample_img_num]
+            pose_token = torch.stack([self.load_pose_to_tensor(p).squeeze(0) for p in selected_pose_paths], dim=0)
+            img_list = [self.preprocess_img(p) for p in selected_img_paths]
 
+            pose_token = self.position_embedding(pose_token)
+            processed_feats = []
+            image_tokens_list = []
+            feat_tokens_list = []
+            for img in img_list:
+                feat, image_token = self.mask_generator.generate(img, True)
+                processed_feat = torch.mean(feat, dim=0).reshape(1, -1)
+                processed_feats.append(processed_feat)
+                feat_tokens_list.append(feat)
+                image_tokens_list.append(image_token)
+            # feat_list = [torch.mean(mask_generator.generate(_, True), dim=0).reshape(1,-1) for _ in img_list]
+            feat_list = torch.cat(processed_feats,dim=0)
+            image_tokens_list = torch.cat(image_tokens_list, dim=0)
+            feat_tokens_list = torch.cat(feat_tokens_list, dim=0)
+            total_feat.append(feat_list)
+            feat_tokens.append(feat_tokens_list)
+            image_tokens.append(image_tokens_list)
+            pose_tokens.append(pose_token)
+            del feat_list
         coordinates, features, inverse_mapping, spatial_shape = self.collate(
             batch_inputs_dict['points'])
         x = spconv.SparseConvTensor(
@@ -792,7 +1522,7 @@ class S3DISOneFormer3D(Base3DDetector):
 
         x = self.extract_feat(x)
 
-        x = self.decoder(x)
+        x,_ = self.decoder(x, None, total_feat, image_tokens, feat_tokens, pose_tokens)
 
         results_list = self.predict_by_feat(x, inverse_mapping)
 
@@ -980,7 +1710,7 @@ class S3DISOneFormer3D(Base3DDetector):
         sem_map_src_mapping += things_sem_mask
         return sem_map_src_mapping, sem_map
 
-    @staticmethod
+    @staticmethod    
     def get_gt_semantic_masks(mask_src, sp_pts_mask, num_classes):    
         """Create ground truth semantic masks.
         
@@ -1327,3 +2057,6 @@ class InstanceOnlyOneFormer3D(Base3DDetector):
                 instance_labels=labels,
                 instance_scores=scores)
         ]
+
+
+

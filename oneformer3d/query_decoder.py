@@ -1,13 +1,21 @@
 import torch
 import torch.nn as nn
 
+
+import math
+
 from mmengine.model import BaseModule
 from mmdet3d.registry import MODELS
 import sys
-sys.path.append("/root/wish/oneformer3d_main/ViT/Point-NN-main")
-from models.transformer import *
+# sys.path.append("/root/wish/Point-NN-main")
+# from models.transformer import *
 import torch.nn.functional as F
-
+import yaml
+# with open("config.yaml","r") as file:
+#     config = yaml.safe_load(file)
+# KAN1_en = config['KAN1_en']
+# KAN2_en = config['KAN2_en']
+# Cross_en = config['Cross_en']
 class CrossAttentionLayer(BaseModule):
     """Cross attention layer.
 
@@ -110,12 +118,16 @@ class FFN(BaseModule):
 
     def __init__(self, d_model, hidden_dim, dropout, activation_fn):
         super().__init__()
+
+        # self.KAN_en = KAN1_en
+
+        
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.ReLU() if activation_fn == 'relu' else nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, d_model),
-            nn.Dropout(dropout))
+            nn.Dropout(dropout))   
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
@@ -163,7 +175,8 @@ class QueryDecoder(BaseModule):
                  objectness_flag, vit_embed_dim=768, vit_num_heads=12,
                  vit_mlp_ratio=4., vit_qkv_bias=True, vit_drop_rate=0.,
                  vit_attn_drop_rate=0., vit_norm_layer=nn.LayerNorm,
-                 vit_act_layer=nn.GELU, vit_depth=12, vit_drop_path_rate=0., **kwargs):
+                 vit_act_layer=nn.GELU, vit_depth=12, vit_drop_path_rate=0., class_balanced_attention=True, 
+                 class_weights=None, **kwargs):
         super().__init__()
         self.objectness_flag = objectness_flag
         self.input_proj = nn.Sequential(
@@ -179,6 +192,31 @@ class QueryDecoder(BaseModule):
         self.cross_attn_layers = nn.ModuleList([])
         self.self_attn_layers = nn.ModuleList([])
         self.ffn_layers = nn.ModuleList([])
+        self.class_balanced_attention = class_balanced_attention
+        if class_balanced_attention:
+            # 初始化权重，如果没有提供则使用均匀权重
+            if class_weights is None:
+                self.register_buffer('class_weights', torch.ones(num_classes + 1))
+            else:
+                self.register_buffer('class_weights', torch.tensor(class_weights))
+                
+            # 类别感知注意力模块
+            self.class_attention = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.ReLU(),
+                nn.Linear(d_model // 2, num_classes + 1),
+            )
+            
+            # 用于特征重调权重的模块
+            self.feature_reweight = nn.Sequential(
+                nn.Linear(d_model + num_classes + 1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU()
+            )
+        # if self.Cross_en:
+        #     self.Cross_layer = nn.ModuleList([])
+
         for i in range(num_layers):
             self.cross_attn_layers.append(
                 CrossAttentionLayer(
@@ -188,9 +226,10 @@ class QueryDecoder(BaseModule):
             self.ffn_layers.append(
                 FFN(d_model, hidden_dim, dropout, activation_fn))
         self.out_norm = nn.LayerNorm(d_model)
+
         self.out_cls = nn.Sequential(        ######
             nn.Linear(d_model, d_model), nn.ReLU(),
-            nn.Linear(d_model, num_classes + 1))
+            nn.Linear(d_model, num_classes + 1))            
         if objectness_flag:
             self.out_score = nn.Sequential(
                 nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 1))
@@ -200,23 +239,41 @@ class QueryDecoder(BaseModule):
              nn.Linear(d_model, d_model))
         self.iter_pred = iter_pred
         self.attn_mask = attn_mask
-
-        #vit
-        dpr = [x.item() for x in torch.linspace(0, vit_drop_path_rate, vit_depth)]
-        self.blocks = nn.Sequential(*[
-            Block(
-                dim=vit_embed_dim, num_heads=vit_num_heads, mlp_ratio=vit_mlp_ratio, qkv_bias=vit_qkv_bias, drop=vit_drop_rate,
-                attn_drop=vit_attn_drop_rate, drop_path=dpr[i], norm_layer=vit_norm_layer, act_layer=vit_act_layer)
-            for i in range(vit_depth)])
-        
-        #融合
-        self.fuse_blocks = nn.Sequential(*[
-            nn.Conv1d(768 * 2, 768, kernel_size = 1)
-            for i in range(6)])
-
-        
-
     
+    def _apply_class_balanced_attention(self, queries, cls_logits):
+        """应用类别平衡注意力机制
+        
+        Args:
+            queries (List[Tensor]): 查询特征，每个形状为 (n_queries_i, d_model)
+            cls_logits (List[Tensor]): 分类logits，每个形状为 (n_queries_i, n_instance_classes + 1)
+            
+        Returns:
+            List[Tensor]: 调整后的查询特征，每个形状为 (n_queries_i, d_model)
+        """
+        balanced_queries = []
+        for i in range(len(queries)):
+            # 计算每个类别的注意力权重
+            class_attn = self.class_attention(queries[i])  # [n_queries, n_classes+1]
+            
+            # 将 logits 转换为概率
+            cls_probs = F.softmax(cls_logits[i], dim=-1)  # [n_queries, n_classes+1]
+            
+            # 应用类别权重（反比于样本数量）
+            weighted_probs = cls_probs * self.class_weights.unsqueeze(0)  # [n_queries, n_classes+1]
+            
+            # 计算归一化的注意力权重
+            attn_weights = F.softmax(class_attn * weighted_probs, dim=-1)  # [n_queries, n_classes+1]
+            
+            # 将注意力权重与查询特征连接，并应用特征重调权重
+            query_concat = torch.cat([queries[i], attn_weights], dim=1)  # [n_queries, d_model+n_classes+1]
+            reweighted_query = self.feature_reweight(query_concat)  # [n_queries, d_model]
+            
+            # 残差连接
+            balanced_query = queries[i] + reweighted_query  # [n_queries, d_model]
+            balanced_queries.append(balanced_query)
+            
+        return balanced_queries
+
     def _get_queries(self, queries=None, batch_size=None):
         """Get query tensor.
 
@@ -240,9 +297,10 @@ class QueryDecoder(BaseModule):
             if queries is not None:
                 result_query.append(self.query_proj(queries[i]))
             result_queries.append(torch.cat(result_query))
+            # result_query.append(self.query_proj(queries[i]))
         return result_queries
 
-    def _forward_head(self, queries, mask_feats):
+    def _forward_head(self, queries, mask_feats, cnt=0, flag=False):
         """Prediction head forward.
 
         Args:
@@ -266,11 +324,19 @@ class QueryDecoder(BaseModule):
         cls_preds, pred_scores, pred_masks, attn_masks = [], [], [], []
         for i in range(len(queries)):
             norm_query = self.out_norm(queries[i])
-            cls_preds.append(self.out_cls(norm_query))
-            pred_score = self.out_score(norm_query) if self.objectness_flag \
+            if flag and cnt == 2:
+                norm_query_3d = norm_query[12:, :]
+                mask_feats_3d = mask_feats[i][12:, :]
+            else:
+                norm_query_3d = norm_query
+                mask_feats_3d = mask_feats[i]
+            cls_preds.append(self.out_cls(norm_query_3d))
+            # if last_flag:
+            #     sem_preds.append(self.out_sem(norm_query_3d))
+            pred_score = self.out_score(norm_query_3d) if self.objectness_flag \
                 else None
             pred_scores.append(pred_score)
-            pred_mask = torch.einsum('nd,md->nm', norm_query, mask_feats[i])
+            pred_mask = torch.einsum('nd,md->nm', norm_query_3d, mask_feats_3d)
             if self.attn_mask:
                 attn_mask = (pred_mask.sigmoid() < 0.5).bool()
                 attn_mask[torch.where(
@@ -315,7 +381,17 @@ class QueryDecoder(BaseModule):
             masks=pred_masks,
             scores=pred_scores), emo_losses
 
-    def forward_iter_pred(self, x, queries):
+    def token_distill_loss(self, pc_feats, img_tokens):
+        pc_feats = F.normalize(pc_feats, dim=-1)       # [N, D]
+        img_tokens = F.normalize(img_tokens, dim=-1)   # [T, D]
+        sim = pc_feats @ img_tokens.T  # cosine similarity
+        nearest_idx = sim.argmax(dim=1)  # [N]
+        matched_tokens = img_tokens[nearest_idx]  # [N, D]
+        cos_sim = (pc_feats * matched_tokens).sum(dim=1)  # [N]
+        loss = 1 - cos_sim.mean()
+        return loss
+
+    def forward_iter_pred(self, x, queries, img_feat, image_tokens, feat_tokens, pose_token):
         """Iterative forward pass.
         
         Args:
@@ -327,23 +403,45 @@ class QueryDecoder(BaseModule):
         Returns:
             Dict: with labels, masks, scores, and aux_outputs.
         """
+        for i in range(len(img_feat)):
+            img_feat[i] = torch.cat([pose_token[i], img_feat[i]], dim=0)
         cls_preds, pred_scores, pred_masks = [], [], []
         inst_feats = [self.input_proj(y) for y in x]
         mask_feats = [self.x_mask(y) for y in x]
-        for i in range(len(mask_feats)):
-            print(mask_feats[i].shape)
         queries = self._get_queries(queries, len(x))
+        distill_loss = 0
+        for i in range(len(queries)):
+            distill_loss = self.token_distill_loss(queries[i], image_tokens[i]) + distill_loss
+        del image_tokens
+        del feat_tokens
         cls_pred, pred_score, pred_mask, attn_mask = self._forward_head(
             queries, mask_feats)
+        queries = self._apply_class_balanced_attention(queries, cls_pred)
+        cls_pred, pred_score, pred_mask, _ = self._forward_head(
+                queries, mask_feats)
         cls_preds.append(cls_pred)
         pred_scores.append(pred_score)
         pred_masks.append(pred_mask)
+
         for i in range(len(self.cross_attn_layers)):
+            if (i == 2):
+                for j in range(len(inst_feats)):
+                    inst_feats[j] = torch.cat([img_feat[j], inst_feats[j]], dim=0)
+                    queries[j] = torch.cat([img_feat[j], queries[j]], dim=0)
+                    mask_feats[j] = torch.cat([img_feat[j], mask_feats[j]], dim=0)
+                    attn_mask[j] = torch.einsum('nd,md->nm', queries[j], mask_feats[j])
+                    attn_mask[j] = (attn_mask[j].sigmoid() < 0.5).bool()
+                    attn_mask[j][torch.where(
+                        attn_mask[j].sum(-1) == attn_mask[j].shape[-1])] = False
+                    attn_mask[j] = attn_mask[j].detach()
             queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
             queries = self.self_attn_layers[i](queries)
             queries = self.ffn_layers[i](queries)
             cls_pred, pred_score, pred_mask, attn_mask = self._forward_head(
                 queries, mask_feats)
+            queries = self._apply_class_balanced_attention(queries, cls_pred)
+            cls_pred, pred_score, pred_mask, _ = self._forward_head(
+                queries, mask_feats, cnt=i, flag=True)
             cls_preds.append(cls_pred)
             pred_scores.append(pred_score)
             pred_masks.append(pred_mask)
@@ -355,9 +453,9 @@ class QueryDecoder(BaseModule):
             cls_preds=cls_preds[-1],
             masks=pred_masks[-1],
             scores=pred_scores[-1],
-            aux_outputs=aux_outputs)
+            aux_outputs=aux_outputs), distill_loss
 
-    def forward(self, x, queries=None):
+    def forward(self, x, queries=None, img_feat=None, image_tokens=None, feat_tokens=None, pose_tokens=None):
         """Forward pass.
         
         Args:
@@ -370,7 +468,7 @@ class QueryDecoder(BaseModule):
             Dict: with labels, masks, scores, and possibly aux_outputs.
         """
         if self.iter_pred:
-            return self.forward_iter_pred(x, queries)
+            return self.forward_iter_pred(x, queries, img_feat, image_tokens, feat_tokens, pose_tokens)
         else:
             return self.forward_simple(x, queries)
 
@@ -380,7 +478,8 @@ class ScanNetQueryDecoder(QueryDecoder):
     """We simply add semantic prediction for each instance query.
     """
     def __init__(self, num_instance_classes, num_semantic_classes,
-                 d_model, num_semantic_linears, **kwargs):
+                 d_model, num_semantic_linears,class_balanced_attention=True, class_weights=None,
+                 **kwargs):
         super().__init__(
             num_classes=num_instance_classes, d_model=d_model, **kwargs)
         assert num_semantic_linears in [1, 2]
@@ -390,8 +489,64 @@ class ScanNetQueryDecoder(QueryDecoder):
                 nn.Linear(d_model, num_semantic_classes + 1))
         else:
             self.out_sem = nn.Linear(d_model, num_semantic_classes + 1)
+        self.class_balanced_attention = class_balanced_attention
+        if class_balanced_attention:
+            # 初始化权重，如果没有提供则使用均匀权重
+            if class_weights is None:
+                self.register_buffer('class_weights', torch.ones(num_instance_classes + 1))
+            else:
+                self.register_buffer('class_weights', torch.tensor(class_weights))
+                
+            # 类别感知注意力模块
+            self.class_attention = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.LayerNorm(d_model // 2),
+                nn.ReLU(),
+                nn.Linear(d_model // 2, num_instance_classes + 1),
+            )
+            
+            # 用于特征重调权重的模块
+            self.feature_reweight = nn.Sequential(
+                nn.Linear(d_model + num_instance_classes + 1, d_model),
+                nn.LayerNorm(d_model),
+                nn.ReLU()
+            )
 
-    def _forward_head(self, queries, mask_feats, last_flag):
+    def _apply_class_balanced_attention(self, queries, cls_logits):
+        """应用类别平衡注意力机制
+        
+        Args:
+            queries (List[Tensor]): 查询特征，每个形状为 (n_queries_i, d_model)
+            cls_logits (List[Tensor]): 分类logits，每个形状为 (n_queries_i, n_instance_classes + 1)
+            
+        Returns:
+            List[Tensor]: 调整后的查询特征，每个形状为 (n_queries_i, d_model)
+        """
+        balanced_queries = []
+        for i in range(len(queries)):
+            # 计算每个类别的注意力权重
+            class_attn = self.class_attention(queries[i])  # [n_queries, n_classes+1]
+            
+            # 将 logits 转换为概率
+            cls_probs = F.softmax(cls_logits[i], dim=-1)  # [n_queries, n_classes+1]
+            
+            # 应用类别权重（反比于样本数量）
+            weighted_probs = cls_probs * self.class_weights.unsqueeze(0)  # [n_queries, n_classes+1]
+            
+            # 计算归一化的注意力权重
+            attn_weights = F.softmax(class_attn * weighted_probs, dim=-1)  # [n_queries, n_classes+1]
+            
+            # 将注意力权重与查询特征连接，并应用特征重调权重
+            query_concat = torch.cat([queries[i], attn_weights], dim=1)  # [n_queries, d_model+n_classes+1]
+            reweighted_query = self.feature_reweight(query_concat)  # [n_queries, d_model]
+            
+            # 残差连接
+            balanced_query = queries[i] + reweighted_query  # [n_queries, d_model]
+            balanced_queries.append(balanced_query)
+            
+        return balanced_queries
+    
+    def _forward_head(self, queries, mask_feats, last_flag, cnt=0, flag=False):
         """Prediction head forward.
 
         Args:
@@ -416,15 +571,23 @@ class ScanNetQueryDecoder(QueryDecoder):
         """
         cls_preds, sem_preds, pred_scores, pred_masks, attn_masks = \
             [], [], [], [], []
+        
         for i in range(len(queries)):
             norm_query = self.out_norm(queries[i])
-            cls_preds.append(self.out_cls(norm_query))
+            if flag and cnt == 5:
+                norm_query_3d = norm_query[12:, :]
+                mask_feats_3d = mask_feats[i][12:, :]
+            else:
+                norm_query_3d = norm_query
+                mask_feats_3d = mask_feats[i]
+
+            cls_preds.append(self.out_cls(norm_query_3d)) # 一个全连接层
             if last_flag:
-                sem_preds.append(self.out_sem(norm_query))
-            pred_score = self.out_score(norm_query) if self.objectness_flag \
+                sem_preds.append(self.out_sem(norm_query_3d))
+            pred_score = self.out_score(norm_query_3d) if self.objectness_flag \
                 else None
             pred_scores.append(pred_score)
-            pred_mask = torch.einsum('nd,md->nm', norm_query, mask_feats[i])
+            pred_mask = torch.einsum('nd,md->nm', norm_query_3d, mask_feats_3d)
             if self.attn_mask:
                 attn_mask = (pred_mask.sigmoid() < 0.5).bool()
                 attn_mask[torch.where(
@@ -454,17 +617,31 @@ class ScanNetQueryDecoder(QueryDecoder):
         queries = self._get_queries(queries, len(x))
         for i in range(len(self.cross_attn_layers)):
             queries = self.cross_attn_layers[i](inst_feats, queries)
+            # print("tfq",queries.shape)
             queries = self.self_attn_layers[i](queries)
             queries = self.ffn_layers[i](queries)
         cls_preds, sem_preds, pred_scores, pred_masks, _ = self._forward_head(
             queries, mask_feats, last_flag=True)
+        queries = self._apply_class_balanced_attention(queries, cls_preds)
+        cls_preds, sem_preds, pred_scores, pred_masks, _ = self._forward_head(
+                queries, mask_feats, last_flag=True)
+        exit()
         return dict(
             cls_preds=cls_preds,
             sem_preds=sem_preds,
             masks=pred_masks,
             scores=pred_scores)
+    def token_distill_loss(self, pc_feats, img_tokens):
+        pc_feats = F.normalize(pc_feats, dim=-1)       # [N, D]
+        img_tokens = F.normalize(img_tokens, dim=-1)   # [T, D]
+        sim = pc_feats @ img_tokens.T  # cosine similarity
+        nearest_idx = sim.argmax(dim=1)  # [N]
+        matched_tokens = img_tokens[nearest_idx]  # [N, D]
+        cos_sim = (pc_feats * matched_tokens).sum(dim=1)  # [N]
+        loss = 1 - cos_sim.mean()
+        return loss
 
-    def forward_iter_pred(self, x, queries):
+    def forward_iter_pred(self, x, queries, img_feat=None, image_tokens=None, feat_tokens=None, pose_token=None):
         """Iterative forward pass.
         
         Args:
@@ -474,38 +651,55 @@ class ScanNetQueryDecoder(QueryDecoder):
                 (n_points_i, in_channles).
         
         Returns:
-            Dict: with instance scores, semantic scores, masks, scores,
-                and aux_outputs.
+            Dict: with instance scores, semantic scores, masks, scores,                     
+                and aux_outputs.S
         """
+        for i in range(len(img_feat)):
+            img_feat[i] = torch.cat([pose_token[i], img_feat[i]], dim=0)
+            # img_feat[i] = pose_token[i] + img_feat[i]
+            # img_feat[i] = (img_feat[i] - img_feat[i].mean()) / (img_feat[i].std() + 1e-8)
         cls_preds, sem_preds, pred_scores, pred_masks = [], [], [], []
         inst_feats = [self.input_proj(y) for y in x]
         mask_feats = [self.x_mask(y) for y in x]
         queries = self._get_queries(queries, len(x))
-        #这里主要是对queries的维度进行转化
+        distill_loss = 0
+        for i in range(len(queries)):
+            distill_loss = self.token_distill_loss(queries[i], image_tokens[i]) + distill_loss
+        del image_tokens
+        del feat_tokens
+        cls_pred, sem_pred, pred_score, pred_mask, _ = \
+                self._forward_head(queries, mask_feats, last_flag=False)     
+        queries = self._apply_class_balanced_attention(queries, cls_pred)
         cls_pred, sem_pred, pred_score, pred_mask, attn_mask = \
-            self._forward_head(queries, mask_feats, last_flag=False)
+                self._forward_head(queries, mask_feats, last_flag=False)
         cls_preds.append(cls_pred)
         sem_preds.append(sem_pred)
         pred_scores.append(pred_score)
         pred_masks.append(pred_mask)
-        # print(inst_feats[0].shape)
-        # print(queries[0].shape)
-        # print(inst_feats[1].shape)
-        # print(queries[1].shape)
         for i in range(len(self.cross_attn_layers)):
-            vit_queries = []
-            for x in queries:
-                x = self.blocks[2 * i](x.unsqueeze(0))
-                x = self.blocks[2 * i + 1](x).squeeze(0)
-                vit_queries.append(x)
+            if (i == 5):
+                for j in range(len(inst_feats)):
+                    inst_feats[j] = torch.cat([img_feat[j], inst_feats[j]], dim=0)
+                    queries[j] = torch.cat([img_feat[j], queries[j]], dim=0)
+                    mask_feats[j] = torch.cat([img_feat[j], mask_feats[j]], dim=0)
+                    attn_mask[j] = torch.einsum('nd,md->nm', queries[j], mask_feats[j])
+                    attn_mask[j] = (attn_mask[j].sigmoid() < 0.5).bool()
+                    attn_mask[j][torch.where(
+                        attn_mask[j].sum(-1) == attn_mask[j].shape[-1])] = False
+                    attn_mask[j] = attn_mask[j].detach()
             queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
             queries = self.self_attn_layers[i](queries)  #这里是自注意力：即k, q, v均为同一个值
+
+
             queries = self.ffn_layers[i](queries)  #一个全连接层
-            queries = [self.fuse_blocks[i](torch.cat([s1.unsqueeze(0), s2.unsqueeze(0)], dim=2).transpose(1, 2)).transpose(2, 1).squeeze(0) 
-                       for s1, s2 in zip(vit_queries, queries)]
             last_flag = i == len(self.cross_attn_layers) - 1
-            cls_pred, sem_pred, pred_score, pred_mask, attn_mask = \
+
+            cls_pred, sem_pred, pred_score, pred_mask, _ = \
                 self._forward_head(queries, mask_feats, last_flag)
+            
+            queries = self._apply_class_balanced_attention(queries, cls_pred)
+            cls_pred, sem_pred, pred_score, pred_mask, attn_mask = \
+                self._forward_head(queries, mask_feats, last_flag, cnt=i, flag=True)
             cls_preds.append(cls_pred)
             sem_preds.append(sem_pred)
             pred_scores.append(pred_score)
@@ -520,12 +714,13 @@ class ScanNetQueryDecoder(QueryDecoder):
             for cls_pred, sem_pred, scores, masks in zip(
                 cls_preds[:-1], sem_preds[:-1],
                 pred_scores[:-1], pred_masks[:-1])]
+
         return dict(
             cls_preds=cls_preds[-1],
             sem_preds=sem_preds[-1],
             masks=pred_masks[-1],
             scores=pred_scores[-1],
-            aux_outputs=aux_outputs)
+            aux_outputs=aux_outputs), distill_loss
 
 
 @MODELS.register_module()
@@ -728,6 +923,7 @@ class OneDataQueryDecoder(BaseModule):
         pred_masks.append(pred_mask)
         for i in range(len(self.cross_attn_layers)):
             queries = self.cross_attn_layers[i](inst_feats, queries, attn_mask)
+            print(queries)
             queries = self.self_attn_layers[i](queries)
             queries = self.ffn_layers[i](queries)
             cls_pred, pred_score, pred_mask, attn_mask = self._forward_head(
@@ -762,3 +958,286 @@ class OneDataQueryDecoder(BaseModule):
             return self.forward_iter_pred(x, scene_names)
         else:
             return self.forward_simple(x, scene_names)
+
+
+class KANLinear(torch.nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        grid_size=5,
+        spline_order=3,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        enable_standalone_scale_spline=True,
+        base_activation=torch.nn.SiLU,
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+    ):
+        super(KANLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+
+        h = (grid_range[1] - grid_range[0]) / grid_size
+        grid = (
+            (
+                torch.arange(-spline_order, grid_size + spline_order + 1) * h
+                + grid_range[0]
+            )
+            .expand(in_features, -1)
+            .contiguous()
+        )
+        self.register_buffer("grid", grid)
+
+        self.base_weight = torch.nn.Parameter(torch.Tensor(out_features, in_features))
+        self.spline_weight = torch.nn.Parameter(
+            torch.Tensor(out_features, in_features, grid_size + spline_order)
+        )
+        if enable_standalone_scale_spline:
+            self.spline_scaler = torch.nn.Parameter(
+                torch.Tensor(out_features, in_features)
+            )
+
+        self.scale_noise = scale_noise
+        self.scale_base = scale_base
+        self.scale_spline = scale_spline
+        self.enable_standalone_scale_spline = enable_standalone_scale_spline
+        self.base_activation = base_activation()
+        self.grid_eps = grid_eps
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5) * self.scale_base)
+        with torch.no_grad():
+            noise = (
+                (
+                    torch.rand(self.grid_size + 1, self.in_features, self.out_features)
+                    - 1 / 2
+                )
+                * self.scale_noise
+                / self.grid_size
+            )
+            self.spline_weight.data.copy_(
+                (self.scale_spline if not self.enable_standalone_scale_spline else 1.0)
+                * self.curve2coeff(
+                    self.grid.T[self.spline_order : -self.spline_order],
+                    noise,
+                )
+            )
+            if self.enable_standalone_scale_spline:
+                # torch.nn.init.constant_(self.spline_scaler, self.scale_spline)
+                torch.nn.init.kaiming_uniform_(self.spline_scaler, a=math.sqrt(5) * self.scale_spline)
+
+    def b_splines(self, x: torch.Tensor):
+        """
+        Compute the B-spline bases for the given input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: B-spline bases tensor of shape (batch_size, in_features, grid_size + spline_order).
+        """
+        assert x.dim() == 2 and x.size(1) == self.in_features
+
+        grid: torch.Tensor = (
+            self.grid
+        )  # (in_features, grid_size + 2 * spline_order + 1)
+        x = x.unsqueeze(-1)
+        bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
+        for k in range(1, self.spline_order + 1):
+            bases = (
+                (x - grid[:, : -(k + 1)])
+                / (grid[:, k:-1] - grid[:, : -(k + 1)])
+                * bases[:, :, :-1]
+            ) + (
+                (grid[:, k + 1 :] - x)
+                / (grid[:, k + 1 :] - grid[:, 1:(-k)])
+                * bases[:, :, 1:]
+            )
+
+        assert bases.size() == (
+            x.size(0),
+            self.in_features,
+            self.grid_size + self.spline_order,
+        )
+        return bases.contiguous()
+
+    def curve2coeff(self, x: torch.Tensor, y: torch.Tensor):
+        """
+        Compute the coefficients of the curve that interpolates the given points.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+            y (torch.Tensor): Output tensor of shape (batch_size, in_features, out_features).
+
+        Returns:
+            torch.Tensor: Coefficients tensor of shape (out_features, in_features, grid_size + spline_order).
+        """
+        assert x.dim() == 2 and x.size(1) == self.in_features
+        assert y.size() == (x.size(0), self.in_features, self.out_features)
+
+        A = self.b_splines(x).transpose(
+            0, 1
+        )  # (in_features, batch_size, grid_size + spline_order)
+        B = y.transpose(0, 1)  # (in_features, batch_size, out_features)
+        solution = torch.linalg.lstsq(
+            A, B
+        ).solution  # (in_features, grid_size + spline_order, out_features)
+        result = solution.permute(
+            2, 0, 1
+        )  # (out_features, in_features, grid_size + spline_order)
+
+        assert result.size() == (
+            self.out_features,
+            self.in_features,
+            self.grid_size + self.spline_order,
+        )
+        return result.contiguous()
+
+    @property
+    def scaled_spline_weight(self):
+        return self.spline_weight * (
+            self.spline_scaler.unsqueeze(-1)
+            if self.enable_standalone_scale_spline
+            else 1.0
+        )
+
+    def forward(self, x: torch.Tensor):
+        assert x.size(-1) == self.in_features
+        original_shape = x.shape
+        x = x.view(-1, self.in_features)
+
+        base_output = F.linear(self.base_activation(x), self.base_weight)
+        spline_output = F.linear(
+            self.b_splines(x).view(x.size(0), -1),
+            self.scaled_spline_weight.view(self.out_features, -1),
+        )
+        output = base_output + spline_output
+        
+        output = output.view(*original_shape[:-1], self.out_features)
+        return output
+
+    @torch.no_grad()
+    def update_grid(self, x: torch.Tensor, margin=0.01):
+        assert x.dim() == 2 and x.size(1) == self.in_features
+        batch = x.size(0)
+
+        splines = self.b_splines(x)  # (batch, in, coeff)
+        splines = splines.permute(1, 0, 2)  # (in, batch, coeff)
+        orig_coeff = self.scaled_spline_weight  # (out, in, coeff)
+        orig_coeff = orig_coeff.permute(1, 2, 0)  # (in, coeff, out)
+        unreduced_spline_output = torch.bmm(splines, orig_coeff)  # (in, batch, out)
+        unreduced_spline_output = unreduced_spline_output.permute(
+            1, 0, 2
+        )  # (batch, in, out)
+
+        # sort each channel individually to collect data distribution
+        x_sorted = torch.sort(x, dim=0)[0]
+        grid_adaptive = x_sorted[
+            torch.linspace(
+                0, batch - 1, self.grid_size + 1, dtype=torch.int64, device=x.device
+            )
+        ]
+
+        uniform_step = (x_sorted[-1] - x_sorted[0] + 2 * margin) / self.grid_size
+        grid_uniform = (
+            torch.arange(
+                self.grid_size + 1, dtype=torch.float32, device=x.device
+            ).unsqueeze(1)
+            * uniform_step
+            + x_sorted[0]
+            - margin
+        )
+
+        grid = self.grid_eps * grid_uniform + (1 - self.grid_eps) * grid_adaptive
+        grid = torch.concatenate(
+            [
+                grid[:1]
+                - uniform_step
+                * torch.arange(self.spline_order, 0, -1, device=x.device).unsqueeze(1),
+                grid,
+                grid[-1:]
+                + uniform_step
+                * torch.arange(1, self.spline_order + 1, device=x.device).unsqueeze(1),
+            ],
+            dim=0,
+        )
+
+        self.grid.copy_(grid.T)
+        self.spline_weight.data.copy_(self.curve2coeff(x, unreduced_spline_output))
+
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        """
+        Compute the regularization loss.
+
+        This is a dumb simulation of the original L1 regularization as stated in the
+        paper, since the original one requires computing absolutes and entropy from the
+        expanded (batch, in_features, out_features) intermediate tensor, which is hidden
+        behind the F.linear function if we want an memory efficient implementation.
+
+        The L1 regularization is now computed as mean absolute value of the spline
+        weights. The authors implementation also includes this term in addition to the
+        sample-based regularization.
+        """
+        l1_fake = self.spline_weight.abs().mean(-1)
+        regularization_loss_activation = l1_fake.sum()
+        p = l1_fake / regularization_loss_activation
+        regularization_loss_entropy = -torch.sum(p * p.log())
+        return (
+            regularize_activation * regularization_loss_activation
+            + regularize_entropy * regularization_loss_entropy
+        )
+
+
+class KAN(torch.nn.Module):
+    def __init__(
+        self,
+        layers_hidden,
+        grid_size=5,
+        spline_order=3,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        base_activation=torch.nn.SiLU,
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+    ):
+        super(KAN, self).__init__()
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+
+        self.layers = torch.nn.ModuleList()
+        for in_features, out_features in zip(layers_hidden, layers_hidden[1:]):
+            self.layers.append(
+                KANLinear(
+                    in_features,
+                    out_features,
+                    grid_size=grid_size,
+                    spline_order=spline_order,
+                    scale_noise=scale_noise,
+                    scale_base=scale_base,
+                    scale_spline=scale_spline,
+                    base_activation=base_activation,
+                    grid_eps=grid_eps,
+                    grid_range=grid_range,
+                )
+            )
+
+    def forward(self, x: torch.Tensor, update_grid=False):
+        x = x.contiguous()
+        for layer in self.layers:
+            if update_grid:
+                layer.update_grid(x)
+            x = layer(x)
+        return x
+
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        return sum(
+            layer.regularization_loss(regularize_activation, regularize_entropy)
+            for layer in self.layers
+        )

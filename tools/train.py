@@ -2,8 +2,9 @@
 import argparse
 import logging
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3" 
 import os.path as osp
-import timm
+# import timm
 from mmengine.config import Config, DictAction
 from mmengine.logging import print_log
 from mmengine.registry import RUNNERS

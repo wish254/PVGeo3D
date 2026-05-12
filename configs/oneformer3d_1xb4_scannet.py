@@ -31,7 +31,7 @@ model = dict(
         num_semantic_classes=num_semantic_classes,
         num_semantic_linears=1,
         in_channels=32,
-        d_model=768,
+        d_model=256,
         num_heads=8,
         hidden_dim=1024,
         dropout=0.0,
@@ -80,7 +80,7 @@ data_prefix = dict(
     pts='points',
     pts_instance_mask='instance_mask',
     pts_semantic_mask='semantic_mask',
-    sp_pts_mask='super_points')
+    sp_pts_mask='superpoints')
 
 train_pipeline = [
     dict(
@@ -166,7 +166,7 @@ test_pipeline = [
 
 # run settings
 train_dataloader = dict(
-    batch_size=2,
+    batch_size=4,
     num_workers=1,
     dataset=dict(
         type=dataset_type,

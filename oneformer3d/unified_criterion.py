@@ -59,7 +59,7 @@ class ScanNetUnifiedCriterion:
                 inst_gt.query_masks = insts[i].query_masks[:-n - 1, :]
             inst_gts.append(inst_gt)
         
-        loss = self.inst_criterion(pred, inst_gts, weights)
+        loss = self.inst_criterion(pred, inst_gts)
         loss.update(self.sem_criterion(pred, sem_gts))
         return loss
 
@@ -155,7 +155,7 @@ class S3DISUnifiedCriterion:
         for i in range(len(pred_masks)):
             sem_preds.append(pred_masks[i][-n:, :])
             pred_masks[i] = pred_masks[i][:-n, :]
-            pred_cls[i] = pred_cls[i][:-n, :]
+            pred_cls[i] = pred_cls[i][:-n]
             pred_scores[i] = pred_scores[i][:-n, :]
 
         return {'masks': sem_preds}

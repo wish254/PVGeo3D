@@ -8,14 +8,15 @@ from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet3d.utils import replace_ceph_backend
-
+import sys
+sys.path.append("/root/wish/oneformer3d_main/")
 
 # TODO: support fuse_conv_bn and format_only
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet3D test (and eval) a model')
-    parser.add_argument('config', help='test config file path')
-    parser.add_argument('checkpoint', help='checkpoint file')
+    parser.add_argument('--config', default='/root/wish/oneformer3d_main/configs/oneformer3d_1xb4_scannet.py', help='test config file path')
+    parser.add_argument('--checkpoint', default='/root/wish/oneformer3d_main/work_dirs/oneformer3d_1xb4_scannet/epoch_506.pth', help='checkpoint file')
     parser.add_argument(
         '--work-dir',
         help='the directory to save the file containing evaluation metrics')

@@ -76,7 +76,7 @@ model = dict(
 
 # dataset settings
 dataset_type = 'ScanNet200SegDataset_'
-data_root = 'data/scannet200/'
+data_root = '/mnt/d/ScanNet200/'
 data_prefix = dict(
     pts='points',
     pts_instance_mask='instance_mask',
@@ -295,7 +295,7 @@ default_hooks = dict(
         save_best=['all_ap_50%', 'miou'],
         rule='greater'))
 
-load_from = 'work_dirs/tmp/mask3d_scannet200.pth'
+load_from = '/root/wish/oneformer3d_main/mask3d_scannet200.pth'
 
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=512, val_interval=16)
 val_cfg = dict(type='ValLoop')

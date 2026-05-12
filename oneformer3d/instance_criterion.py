@@ -23,10 +23,10 @@ def batch_sigmoid_bce_loss(inputs, targets):
     neg = F.binary_cross_entropy_with_logits(
         inputs, torch.zeros_like(inputs), reduction='none')
 
+    
     pos_loss = torch.einsum('nc,mc->nm', pos, targets)
     neg_loss = torch.einsum('nc,mc->nm', neg, (1 - targets))
     return (pos_loss + neg_loss) / inputs.shape[1]
-
 
 def batch_dice_loss(inputs, targets):
     """Dice loss.
@@ -122,6 +122,25 @@ class InstanceCriterion:
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
+    def focal_loss(self, inputs, targets, alpha=0.25, gamma=2.0, weight=None, reduction="mean"):
+        """
+        inputs: [N, C]，logits（未经过softmax）
+        targets: [N]，类别id
+        alpha: 平衡因子
+        gamma: 聚焦因子
+        weight: 类别权重（跟cross_entropy的weight一样）
+        """
+        ce_loss = F.cross_entropy(inputs, targets, weight=weight, reduction="none")
+        pt = torch.exp(-ce_loss)   # pt = softmax概率对应真实类别
+        focal_loss = alpha * (1 - pt) ** gamma * ce_loss
+
+        if reduction == "mean":
+            return focal_loss.mean()
+        elif reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
     def compute_emo_loss(self, cls_pred, cls_target, weights, smoothing=0.1):
         one_hot = torch.nn.functional.one_hot(cls_target, num_classes = self.num_classes + 1).float()
         # one_hot = one_hot * (1 - smoothing) + smoothing / (self.num_classes + 1)
@@ -135,6 +154,32 @@ class InstanceCriterion:
         q_contextual_repr = q_final @ embedding_matrix 
         emo_loss = torch.abs((1 - torch.sum(p_contextual_repr*q_contextual_repr, dim=-1)) - (1 - torch.sum(p_contextual_repr*p_contextual_repr, dim=-1)))
         return emo_loss
+
+    def adaptive_balanced_bce_loss(self, pred_mask, tgt_mask, eps=1e-6):
+        """
+        Adaptive Balanced BCE Loss
+        Args:
+            pred_mask: (N,) raw logits
+            tgt_mask: (N,) binary {0,1}
+        """
+        # 正样本和负样本数量
+        pos = (tgt_mask == 1).float()
+        neg = (tgt_mask == 0).float()
+        n_pos = pos.sum()
+        n_neg = neg.sum()
+
+        # 自适应平衡因子 alpha
+        alpha = n_neg / (n_pos + n_neg + eps)
+
+        # BCE 损失
+        loss = F.binary_cross_entropy_with_logits(
+            pred_mask, tgt_mask.float(), reduction='none'
+        )
+        # 前景和背景分开加权
+        loss = alpha * (pos * loss) + (1 - alpha) * (neg * loss)
+
+        return loss.mean()
+
 
     def get_layer_loss(self, aux_outputs, insts, indices=None):
         """Per layer auxiliary loss.
@@ -191,7 +236,7 @@ class InstanceCriterion:
 
             pred_mask = mask[idx_q]
             tgt_mask = inst.sp_masks[idx_gt]
-            mask_bce_losses.append(F.binary_cross_entropy_with_logits(
+            mask_bce_losses.append(self.adaptive_balanced_bce_loss(
             pred_mask, tgt_mask.float()))
             mask_dice_losses.append(dice_loss(pred_mask, tgt_mask.float()))
             
@@ -239,7 +284,7 @@ class InstanceCriterion:
         return loss
 
     # todo: refactor pred to InstanceData_
-    def __call__(self, pred, insts, weights):
+    def __call__(self, pred, insts):
         """Loss main function.
 
         Args:
@@ -277,6 +322,22 @@ class InstanceCriterion:
             indices.append(self.matcher(pred_instances, gt_instances))
 
         # class loss
+        # cls_losses = []
+        # for cls_pred, inst, (idx_q, idx_gt) in zip(cls_preds, insts, indices):
+        #     n_classes = cls_pred.shape[1] - 1
+        #     cls_target = cls_pred.new_full(
+        #         (len(cls_pred),), n_classes, dtype=torch.long)
+        #     cls_target[idx_q] = inst.labels_3d[idx_gt]
+            
+        #     # focal loss 代替 cross entropy
+        #     loss = self.focal_loss(
+        #         cls_pred, cls_target, alpha=0.25, gamma=2.0,
+        #         weight=cls_pred.new_tensor(self.class_weight),
+        #         reduction="mean"
+        #     )
+        #     cls_losses.append(loss)
+
+        # cls_loss = torch.mean(torch.stack(cls_losses))
         cls_losses = []
         for cls_pred, inst, (idx_q, idx_gt) in zip(cls_preds, insts, indices):
             n_classes = cls_pred.shape[1] - 1
@@ -410,7 +471,7 @@ class MaskBCECost:
             Tensor: Cost of shape (n_queries, n_gts).
         """
         cost = batch_sigmoid_bce_loss(
-            pred_instances.masks, gt_instances.masks.float())
+            pred_instances.masks.float(), gt_instances.masks.float())
         return cost * self.weight
 
 
@@ -477,6 +538,7 @@ class HungarianMatcher:
         cost_values = []
         for cost in self.costs:
             cost_values.append(cost(pred_instances, gt_instances))
+
         cost_value = torch.stack(cost_values).sum(dim=0)
         query_ids, object_ids = linear_sum_assignment(cost_value.cpu().numpy())
         return labels.new_tensor(query_ids), labels.new_tensor(object_ids)
